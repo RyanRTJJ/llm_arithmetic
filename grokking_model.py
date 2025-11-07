@@ -6,6 +6,12 @@ Desc:       Reproduce the Neel Nanda Grokking (modulo addition) Paper: https://o
 Date:       2025, Nov 5 started
 Author:     ryan.rtjj@gmail.com
 """
+import glob
+import os
+from pathlib import Path
+import pickle
+import random
+
 import einops
 import numpy as np
 import torch
@@ -22,6 +28,7 @@ D_MLP = 512
 ACT_TYPE = 'ReLU'
 NUM_HEADS = 4
 N_CTX = 3
+PRIME = 113
 
 class Embed(nn.Module):
     """
@@ -196,6 +203,101 @@ class Transformer(nn.Module):
         x = self.unembed(x)
         return x
 
+def generate_data(
+        frac_train: float,
+        P: int,
+        seed: int = 0,
+        save_filename: str | None = None,
+    ) -> tuple[list[tuple], list[tuple], list[tuple], list[bool], list[bool]]:
+    """
+    Generates all permutations in [0, P) and splits into train and test sets
+
+    @return:    [0]: All data, e.g. [(0, 0, 113), (0, 1, 113), ...]
+                [1]: list of train tuples, e.g. [(0, 0, 113), (0, 7, 113), ...]
+                [2]: list of test tuples, e.g. [(0, 1, 113), (0, 2, 113), ...] 
+                [3]: bool mask representing train samples, e.g. [True, False, ...]
+                [4]: bool mask representing test samples, e.g. [False, True, ...]
+    """
+    pairs = [(i, j, P) for i in range(P) for j in range(P)]
+    random.seed(seed)
+    random.shuffle(pairs)
+    num_train = int(frac_train * len(pairs))
+
+    train_pairs = pairs[:num_train]
+    test_pairs = pairs[num_train:]
+
+    is_train = []
+    is_test = []
+
+    for x in range(P):
+        for y in range(P):
+            if (x, y, P) in train_pairs:
+                is_train.append(True)
+                is_test.append(False)
+            else:
+                is_train.append(False)
+                is_test.append(True)
+
+    if save_filename:
+        if not save_filename.suffix == '.pkl':
+            save_filename = save_filename + '.pkl'
+
+        with open(save_filename, 'wb') as f:
+            pickle.dump({
+                'pairs': pairs,
+                'train_pairs': train_pairs,
+                'test_pairs': test_pairs,
+                'is_train': is_train,
+                'is_test': is_test
+            }, f)
+
+        file_size = os.path.getsize(save_filename)
+        file_size_mb = file_size / (1024 * 1024)
+
+        print(f'Saved generated data to {save_filename}. File size: {file_size_mb:.3f} MB')
+
+    return pairs, train_pairs, test_pairs, is_train, is_test
+
+def prepare_dirs(dirs: list[Path], clear: bool = True):
+    for _dir in dirs:
+        try:
+            os.mkdir(_dir)
+        except:
+            pass
+
+        if clear:
+            files = glob.glob(f'{_dir}/*')
+            for f in files:
+                os.remove(f)
+
+def train(
+        model: nn.Module,
+        data_file: Path,
+        checkpoints_dir: Path,
+        batch_size: int = -1
+    ):
+    """
+    Simple training loop
+    """
+    # Read the data
+    with open(data_file, 'rb') as f:
+        all_data = pickle.load(f)
+    
+    pairs = all_data['pairs']
+    train_pairs = all_data['train_pairs']
+    test_pairs = all_data['test_pairs']
+
+    # Generate labels
+    labels = [(a + b) % P for (a, b, P) in pairs]
+
+    # Compute batch_size
+    if batch_size == -1:
+        
+
+
 if __name__ == '__main__':
-    model = Transformer()
-    print(model)
+    CHECKPOINTS_DIR = Path('checkpoints')
+    DATA_DIR = Path('datasets')
+    prepare_dirs([CHECKPOINTS_DIR, DATA_DIR], True)
+    generate_data(0.3, P=PRIME, save_filename=DATA_DIR / 'debug.pkl')
+    # model = Transformer()
