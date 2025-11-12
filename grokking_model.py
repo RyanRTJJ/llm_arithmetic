@@ -7,28 +7,41 @@ Date:       2025, Nov 5 started
 Author:     ryan.rtjj@gmail.com
 """
 import glob
+import io
 import os
 from pathlib import Path
 import pickle
 import random
 
 import einops
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.optim as optim
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torch.utils.tensorboard import SummaryWriter
+from PIL import Image
+
+# +-------+
+# | utils |
+# +-------+
+BACKGROUND_COLOR = '#FCFBF8'
 
 # +-----------+
 # | Model def |
 # +-----------+
-D_VOCAB = 113
+PRIME = 113
+D_VOCAB = 113 + 1 # The last token is for the '=' sign (where we do read-out)
 D_MODEL = 128
 D_HEAD = 32
 D_MLP = 512
 ACT_TYPE = 'ReLU'
 NUM_HEADS = 4
 N_CTX = 3
-PRIME = 113
 
 class Embed(nn.Module):
     """
@@ -40,7 +53,7 @@ class Embed(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """
-        Note that x is shape (batch, n_ctx)
+        Note that x is shape (batch, n_ctx), where each value is the token number
         """
         return torch.einsum('dbp -> bpd', self.W_E[:, x])
 
@@ -94,7 +107,8 @@ class Attention(nn.Module):
 
         # Another weird normalization
         attn_matrix = F.softmax(attn_scores_masked / np.sqrt(self.d_head), dim=-1)
-        z = torch.einsum('biph,biqh->biqh', v, attn_matrix)
+
+        z = torch.einsum('biph,biqp->biqh', v, attn_matrix)
         z_flat = einops.rearrange(z, 'b i q h -> b q (i h)')
         out = torch.einsum('df,bqf->bqd', self.W_O, z_flat)
         return out
@@ -160,7 +174,7 @@ class Transformer(nn.Module):
 
     Model Architecture:
 
-    R^113 (1-hot)         R^128                  R^128                    R^512                      R^128                   R^113
+    R^1 (idxs)           R^128                  R^128                    R^512                      R^128                   R^114
     INPUT --- embed --> EMBEDDING --- attn --> MLP_INPUT --- mlp_up --> MLP_ACTS --- mlp_down --> EMBEDDING --- unembed --> LOGITS
                 W_E              attention block               W_up         ReLU        W_down                     W_U
     """
@@ -197,11 +211,37 @@ class Transformer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.embed(x)
-        x = self.pos_embed(x)
         for block in self.blocks:
             x = block(x)
         x = self.unembed(x)
         return x
+
+class MyDataset(Dataset):
+    def __init__(self, pairs: list[tuple]):
+        """
+        @param pairs:     A list of triplets actually, lol. (a, b, P)
+        """
+        self.pairs = pairs
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        # Convert to tensors
+        x = torch.tensor(self.pairs[idx], dtype=torch.long)
+        y = (self.pairs[idx][0] + self.pairs[idx][1]) % self.pairs[idx][2]
+        y = torch.tensor(y, dtype=torch.long)
+        return x, y
+
+def beautify_ax(ax: plt.Axes, xmin: float, xmax: float, ymin: float, ymax: float, ignore_aspect_ratio=False):
+    ax.set_facecolor(BACKGROUND_COLOR)
+    ax.set_xlim((xmin, xmax))
+    ax.set_ylim((ymin, ymax))
+    if not ignore_aspect_ratio:
+        aspect_ratio = (xmax - xmin) / (ymax - ymin)
+        ax.set_aspect(aspect_ratio)
+    for spine in ['top', 'right']:
+        ax.spines[spine].set_visible(False)
 
 def generate_data(
         frac_train: float,
@@ -260,10 +300,7 @@ def generate_data(
 
 def prepare_dirs(dirs: list[Path], clear: bool = True):
     for _dir in dirs:
-        try:
-            os.mkdir(_dir)
-        except:
-            pass
+        _dir.mkdir(parents=True, exist_ok=True)
 
         if clear:
             files = glob.glob(f'{_dir}/*')
@@ -274,7 +311,12 @@ def train(
         model: nn.Module,
         data_file: Path,
         checkpoints_dir: Path,
-        batch_size: int = -1
+        tensorboards_dir: Path,
+        batch_size: int = -1,
+        epochs: int = 2,
+        lr: float = 0.001,
+        weight_decay: float = 1.0,
+        model_save_freq: int = 200,
     ):
     """
     Simple training loop
@@ -282,22 +324,158 @@ def train(
     # Read the data
     with open(data_file, 'rb') as f:
         all_data = pickle.load(f)
-    
-    pairs = all_data['pairs']
+
     train_pairs = all_data['train_pairs']
     test_pairs = all_data['test_pairs']
 
-    # Generate labels
-    labels = [(a + b) % P for (a, b, P) in pairs]
-
     # Compute batch_size
     if batch_size == -1:
-        
+        batch_size = len(train_pairs)
+    else:
+        batch_size = min(len(train_pairs), batch_size)
+
+    # Generate dataset / dataloader
+    train_dataset = MyDataset(pairs=train_pairs)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size)
+    test_dataset = MyDataset(pairs=test_pairs)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+    total_batches = epochs * len(train_dataloader)
+
+    # Create utils stuff
+    pbar = tqdm(total=total_batches, desc='Training')
+    writer = SummaryWriter(tensorboards_dir)
+
+    # Define criterion
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    epoch_train_loss_history = []
+    epoch_test_loss_history = []
+    epoch_test_acc_history = []
+    epoch_W_E_ss_history = []
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_train_loss = 0.0
+
+        for batch_x, batch_y in train_dataloader:
+            # forward pass
+            logits = model(batch_x)[:,-1,:] # only take the last position
+            loss = criterion(logits, batch_y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_item = loss.item()
+            epoch_train_loss += loss_item
+
+            # Update pbar
+            pbar.set_postfix({
+                'epoch': f'{epoch + 1} / {epochs}',
+                'loss': f'{loss_item:.4f}'
+            })
+            pbar.update(1)
+
+        model.eval()
+        epoch_test_loss = 0.0
+        epoch_num_correct = 1.0
+        for batch_x, batch_y in test_dataloader:
+            # forward pass
+            logits = model(batch_x)[:,-1,:] # only take the last position
+            loss = criterion(logits, batch_y)
+            preds = torch.argmax(logits, dim=-1)
+            num_correct = (preds == batch_y).sum().item()
+            epoch_num_correct += num_correct
+
+            loss_item = loss.item()
+            epoch_test_loss += loss_item
+
+        epoch_test_acc = epoch_num_correct / len(test_dataset)
+
+        # Update histories
+        epoch_train_loss_history += [epoch_train_loss]
+        epoch_test_loss_history += [epoch_test_loss]
+        epoch_test_acc_history += [epoch_test_acc]
+        W_E = model.embed.W_E.detach().cpu().numpy()
+        W_E_ss = np.sum(W_E ** 2)
+        epoch_W_E_ss_history.append(W_E_ss)
+
+        if (epoch + 1) % model_save_freq == 0:
+            epoch_checkpoint_dict = {
+                'epoch': epoch,
+                'epoch_train_loss_history': epoch_train_loss_history,
+                'epoch_test_loss_history': epoch_test_loss_history,
+                'epoch_test_acc_history': epoch_test_acc_history,
+                'epoch_W_E_ss_history': epoch_W_E_ss_history,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+
+            torch.save(epoch_checkpoint_dict, checkpoints_dir / f'epoch_{epoch}.pt')
+
+        # Plot
+        fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(13, 6))
+        cmap = plt.get_cmap('coolwarm', 7)
+        enumerated_epochs = np.linspace(1, epoch + 1, epoch + 1)
+        xmin = 0
+        xmax = epochs
+        ymin = 0
+
+        # Losses
+        axes[0].plot(enumerated_epochs, epoch_train_loss_history, color=cmap(2), label='Train Loss')
+        axes[0].plot(enumerated_epochs, epoch_test_loss_history, color=cmap(5), label='Test Loss')
+        axes[0].set_title('Losses', fontsize=10, fontweight='normal')
+        beautify_ax(
+            axes[0], xmin, xmax, ymin, max(epoch_train_loss_history + epoch_test_loss_history)
+        )
+        axes[0].legend()
+
+        # Acc
+        axes[1].plot(enumerated_epochs, epoch_test_acc_history, color='black')
+        axes[1].set_title('Test Accuracy', fontsize=10, fontweight='normal')
+        beautify_ax(axes[1], xmin, xmax, ymin, 1.0)
+
+        # Sum of squares of W_E
+        axes[2].plot(enumerated_epochs, epoch_W_E_ss_history, color='grey')
+        axes[2].set_title('W_E Sum of Squares', fontsize=10, fontweight='normal')
+        axes[2].set_yscale('log')  # Add log scale to y-axis
+        W_E_ss_ymax = max(epoch_W_E_ss_history)
+        W_E_ss_ymin = 10.
+        beautify_ax(axes[2], xmin, xmax, W_E_ss_ymin, W_E_ss_ymax, ignore_aspect_ratio=True)
+        y_span = np.log10(W_E_ss_ymax) - np.log10(W_E_ss_ymin)
+        aspect_ratio = (xmax - xmin) / y_span
+        axes[2].set_aspect(aspect_ratio)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf)
+        img_np = np.array(img)
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+
+        writer.add_image('Training Metrics', img_tensor, global_step=epoch)
+
 
 
 if __name__ == '__main__':
-    CHECKPOINTS_DIR = Path('checkpoints')
-    DATA_DIR = Path('datasets')
-    prepare_dirs([CHECKPOINTS_DIR, DATA_DIR], True)
-    generate_data(0.3, P=PRIME, save_filename=DATA_DIR / 'debug.pkl')
-    # model = Transformer()
+    RUN_NAME = 'debug'
+
+    CHECKPOINTS_DIR = Path(f'checkpoints/{RUN_NAME}')
+    DATA_DIR = Path(f'datasets/{RUN_NAME}')
+    TENSORBOARDS_DIR = Path(f'tensorboards/{RUN_NAME}')
+    prepare_dirs([CHECKPOINTS_DIR, DATA_DIR, TENSORBOARDS_DIR], True)
+
+    data_file = DATA_DIR / 'dataset.pkl'
+    generate_data(0.3, P=PRIME, save_filename=data_file)
+
+
+    model = Transformer()
+    train(
+        model,
+        data_file,
+        CHECKPOINTS_DIR,
+        TENSORBOARDS_DIR,
+        epochs=20000,
+    )
