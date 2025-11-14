@@ -235,12 +235,22 @@ def inspect_attention_maps(
         model: Transformer,
         test_pairs: list[tuple[int, int, int]],
         num_samples: int = 2,
+        show_only_last_attn_row: bool = True,
 ):
     """
     Plots the attention maps of all heads on some of the test_pairs.
     """
-    assert num_samples <= 8, 'Give a reasonable number of samples plz.'
-    sample_pairs = random.sample(test_pairs, num_samples)
+    # assert num_samples <= 8, 'Give a reasonable number of samples plz.'
+    # sample_pairs = random.sample(test_pairs, num_samples)
+
+    x = 42
+    y = [i for i in range(0, 60)]
+    sample_pairs = [(x, _y, 113) for _y in y]
+
+    # y = 70
+    # x = [i for i in range(0, 60)]
+    # sample_pairs = [(_x, y, 113) for _x in x]
+
     num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
     print(f'\n🔍 Inspecting attn maps for pairs: {sample_pairs}...')
 
@@ -268,33 +278,103 @@ def inspect_attention_maps(
 
     # Plot
     num_heads = len(activations_by_head)
-    fig, axs = plt.subplots(nrows=num_heads, ncols=num_samples, figsize=(2 * num_samples, 8))
+    fig, axs = plt.subplots(nrows=num_samples, ncols=num_heads, figsize=(4, min(12, 2 * num_samples)))
 
     for head_i in range(num_heads):
         head_activations = activations_by_head[f'head_{head_i}']
         for sample_i, attn_map in enumerate(head_activations):
-            ax = axs[head_i, sample_i]
+            ax = axs[sample_i, head_i]
             attn_map_np = attn_map.numpy()
+
+            if show_only_last_attn_row:
+                attn_map_np = attn_map_np[-1,:][None,:]
+
             im = ax.imshow(attn_map_np, cmap='coolwarm', vmin=-1, vmax=1)
             ax.axis('off')
 
             if head_i == 0:
                 # label row
                 s_pair = sample_pairs[sample_i]
-                ax.set_title(f'{s_pair[0]} + {s_pair[1]} =', fontsize=8)
-            if sample_i == 0:
                 ax.text(
-                    -0.1,
+                    -0.2,
                     0.5,
-                    f'Head {head_i}',
+                    f'{s_pair[0]} + {s_pair[1]} =',
                     transform=ax.transAxes,
-                    fontsize=10,
+                    fontsize=8,
                     ha='right',
                     va='center',
                     rotation=0
                 )
+            if sample_i == 0:
+                ax.set_title(f'Head {head_i}', fontsize=8)
     
     # plt.tight_layout()
+    plt.show()
+
+def inspect_attention_maps_periodic_nature(
+        model: Transformer,
+):
+    """
+    Plot Fourier Coefficient Norms of last rows of attention maps
+    """
+    # Create sample pairs
+    P = 113
+    x = 70
+    y = [i for i in range(0, P)]
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
+    print(f'\n🔍 Inspecting attn maps for periodic nature for pairs: {sample_pairs}...')
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    activation_cache = {}
+    model.remove_all_hooks()
+    model.cache_all(activation_cache)
+
+    # Forward pass and collect the activations (attn only)
+    model.eval()
+    activations_by_head = {}
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+
+        attn_activations = activation_cache['blocks.0.attn.hook_attn']
+        # Expect this to have shape (b, num_heads, pos=3, pos=3)
+
+        _, num_heads, _, _ = attn_activations.shape
+        for i in range(num_heads):
+            activations_by_head[f'head_{i}'] = attn_activations[:,i,:,:]
+
+    # Plot
+    num_heads = len(activations_by_head)
+    fig, axs = plt.subplots(nrows=num_heads, ncols=1, figsize=(12, 8))
+    cmap = plt.get_cmap('coolwarm', 7)
+
+    for head_i in range(num_heads):
+        head_activations = activations_by_head[f'head_{head_i}']
+
+        head_activations_last_rows = head_activations[:,-1,:]    # shape (B, 3)
+        fourier_coeffs = get_fourier_coeffs_by_hand(head_activations_last_rows.T, P)
+        fourier_coeff_norms = fourier_coeffs.norm(dim=0)
+
+        x_axis = np.linspace(1, P, P - 1)
+        x_ticks = [i for i in range(0, P, 10)]
+        x_tick_labels = [i // 2 for i in range(0, P, 10)]
+
+        colors = [cmap(2) if i % 2 == 0 else cmap(5) for i in range(P)]
+        ax = axs[head_i]
+        ax.bar(x_axis, fourier_coeff_norms[1:], width=0.6, color=colors)
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels(x_tick_labels)
+
+        ax.set_ylabel(f'Head {head_i}')
+        ax.set_xlabel('Frequency (k)')
+        ax.set_facecolor(BACKGROUND_COLOR)
+
+    plt.suptitle('Relative Norm of Attention Map (Last Row) Fourier Coefficients (by head)', fontsize=10)
     plt.show()
 
 
@@ -307,4 +387,5 @@ if __name__ == '__main__':
     train_pairs, test_pairs = load_data(DATA_FILE)
     # inspect_periodic_nature(model, weight_matrix='W_L', do_DFT_by_hand=True)
     # inspect_PCA_W_E(model, weight_matrix='W_L', k_vals=[4, 32, 43])
-    inspect_attention_maps(model, test_pairs, num_samples=8)
+    inspect_attention_maps(model, test_pairs, num_samples=6, show_only_last_attn_row=True)
+    # inspect_attention_maps_periodic_nature(model)
