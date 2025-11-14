@@ -43,6 +43,42 @@ ACT_TYPE = 'ReLU'
 NUM_HEADS = 4
 N_CTX = 3
 
+class HookPoint(nn.Module):
+    """
+    Wraps any nn.Module's forward() call in an identity function for
+    the sake of capturing the value of the any intermediate calculation
+    """
+    def __init__(self):
+        super().__init__()
+        self.fwd_hooks = []
+
+    def give_name(self, name):
+        self.name = name
+
+    def add_hook(self, hook: callable):
+        """
+        @param hook:        Accepts parameters (activation, hook_name).
+                            We have to change it into PyTorch hook format,
+                            which is (module, input, output)
+        """
+        def torch_hook(module: nn.Module, input: torch.Tensor, output: torch.Tensor):
+            """
+            torch-compatible interface. Implements our actual hook under the hood.
+            """
+            # Doesn't matter if it's output or input; they're the same
+            return hook(output, name=self.name)
+
+        handle = self.register_forward_hook(torch_hook)
+        self.fwd_hooks.append(handle)
+
+    def remove_hooks(self):
+        for handle in self.fwd_hooks:
+            handle.remove()
+        self.fwd_hooks = []
+    
+    def forward(self, x: torch.Tensor):
+        return x
+
 class Embed(nn.Module):
     """
     Simple dictionary lookup.
@@ -92,6 +128,9 @@ class Attention(nn.Module):
 
         self.register_buffer('mask', torch.tril(torch.ones((n_ctx, n_ctx))))
 
+        # Hooks
+        self.hook_attn = HookPoint()
+
     def forward(self, x: torch.Tensor):
         """
         @param x:   Tensor of shape (batch, positions, d_model)
@@ -106,13 +145,15 @@ class Attention(nn.Module):
         attn_scores_masked = torch.tril(attn_scores_pre) - 1e10 * (1 - self.mask[:pos, :pos])
 
         # Another weird normalization
-        attn_matrix = F.softmax(attn_scores_masked / np.sqrt(self.d_head), dim=-1)
+        attn_matrix = self.hook_attn(
+            F.softmax(attn_scores_masked / np.sqrt(self.d_head), dim=-1)
+        )
 
         z = torch.einsum('biph,biqp->biqh', v, attn_matrix)
         z_flat = einops.rearrange(z, 'b i q h -> b q (i h)')
         out = torch.einsum('df,bqf->bqd', self.W_O, z_flat)
         return out
-    
+
 class MLP(nn.Module):
     def __init__(
             self,
@@ -208,6 +249,28 @@ class Transformer(nn.Module):
             ) for _ in range(num_layers)
         ])
         self.unembed = Unembed(d_vocab, d_model)
+
+        # Give all hooks a name
+        for name, module in self.named_modules():
+            if isinstance(module, HookPoint):
+                module.give_name(name)
+
+    def hook_points(self):
+        return [module for name, module in self.named_modules() if 'hook' in name]
+    
+    def remove_all_hooks(self):
+        """
+        Enumerates over all hooks in all components of the model and removes them
+        """
+        for hp in self.hook_points():
+            hp.remove_hooks()
+
+    def cache_all(self, cache: dict[str, torch.Tensor]):
+        def save_hook(activation_tensor: torch.Tensor, name: str):
+            cache[name] = activation_tensor.detach()
+
+        for hook_point in self.hook_points():
+            hook_point.add_hook(save_hook)
 
     def forward(self, x: torch.Tensor):
         x = self.embed(x)

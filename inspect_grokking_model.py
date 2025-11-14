@@ -3,11 +3,15 @@ Desc:   Having trained the model to grok the modulo arithmetic problem, we want 
         1.  Confirm the existence of periodic structure
 """
 from pathlib import Path
+import pickle
+import random
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
+from grokking_model import MyDataset
 from grokking_model import Transformer
 
 # +-------+
@@ -37,6 +41,21 @@ def load_model(checkpoint_file: Path) -> Transformer:
     print(f'✅ model loaded from {checkpoint_file}')
     return model
 
+def load_data(data_file: Path) -> tuple[list, list]:
+    """
+    @return:    [0] train_pairs
+                [1] test_pairs
+    """
+    # Read the data
+    with open(data_file, 'rb') as f:
+        all_data = pickle.load(f)
+
+    train_pairs = all_data['train_pairs']
+    test_pairs = all_data['test_pairs']
+
+    print(f'✅ data loaded from {data_file}')
+    return train_pairs, test_pairs
+
 def get_fourier_coeffs_by_hand(W: torch.Tensor, P: int) -> torch.Tensor:
     """
     This function assumes the periodic structure is over dimension 1
@@ -64,7 +83,6 @@ def get_fourier_coeffs_by_hand(W: torch.Tensor, P: int) -> torch.Tensor:
 
     fourier_coeffs = W @ fourier_basis.T
     return fourier_coeffs
-
 
 def inspect_periodic_nature(
         model: Transformer,
@@ -213,10 +231,80 @@ def inspect_PCA_W_E(
 
     plt.show()
 
+def inspect_attention_maps(
+        model: Transformer,
+        test_pairs: list[tuple[int, int, int]],
+        num_samples: int = 2,
+):
+    """
+    Plots the attention maps of all heads on some of the test_pairs.
+    """
+    assert num_samples <= 8, 'Give a reasonable number of samples plz.'
+    sample_pairs = random.sample(test_pairs, num_samples)
+    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
+    print(f'\n🔍 Inspecting attn maps for pairs: {sample_pairs}...')
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    activation_cache = {}
+    model.remove_all_hooks()
+    model.cache_all(activation_cache)
+
+    # Forward pass and collect the activations (attn only)
+    model.eval()
+    activations_by_head = {}
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+
+        attn_activations = activation_cache['blocks.0.attn.hook_attn']
+        # Expect this to have shape (b, num_heads, pos=3, pos=3)
+
+        _, num_heads, _, _ = attn_activations.shape
+        for i in range(num_heads):
+            activations_by_head[f'head_{i}'] = attn_activations[:,i,:,:]
+
+    # Plot
+    num_heads = len(activations_by_head)
+    fig, axs = plt.subplots(nrows=num_heads, ncols=num_samples, figsize=(2 * num_samples, 8))
+
+    for head_i in range(num_heads):
+        head_activations = activations_by_head[f'head_{head_i}']
+        for sample_i, attn_map in enumerate(head_activations):
+            ax = axs[head_i, sample_i]
+            attn_map_np = attn_map.numpy()
+            im = ax.imshow(attn_map_np, cmap='coolwarm', vmin=-1, vmax=1)
+            ax.axis('off')
+
+            if head_i == 0:
+                # label row
+                s_pair = sample_pairs[sample_i]
+                ax.set_title(f'{s_pair[0]} + {s_pair[1]} =', fontsize=8)
+            if sample_i == 0:
+                ax.text(
+                    -0.1,
+                    0.5,
+                    f'Head {head_i}',
+                    transform=ax.transAxes,
+                    fontsize=10,
+                    ha='right',
+                    va='center',
+                    rotation=0
+                )
+    
+    # plt.tight_layout()
+    plt.show()
+
 
 if __name__ == '__main__':
     CHECKPOINT_FILE = 'checkpoints/grokked_20k/epoch_19999.pt'
     # CHECKPOINT_FILE = 'sparse_checkpoints/grokked_10k/epoch_9999.pt'
+    DATA_FILE = 'datasets/grokked_20k/dataset.pkl'
+
     model = load_model(CHECKPOINT_FILE)
+    train_pairs, test_pairs = load_data(DATA_FILE)
     # inspect_periodic_nature(model, weight_matrix='W_L', do_DFT_by_hand=True)
-    inspect_PCA_W_E(model, weight_matrix='W_L', k_vals=[4, 32, 43])
+    # inspect_PCA_W_E(model, weight_matrix='W_L', k_vals=[4, 32, 43])
+    inspect_attention_maps(model, test_pairs, num_samples=8)
