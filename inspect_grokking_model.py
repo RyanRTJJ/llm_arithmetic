@@ -7,7 +7,9 @@ import pickle
 import random
 
 import matplotlib.pyplot as plt
+import matplotlib.collections as mc
 import numpy as np
+from scipy.interpolate import make_interp_spline
 import torch
 from torch.utils.data import DataLoader
 
@@ -150,7 +152,6 @@ def inspect_PCA_W_E(
     for k in k_vals:
         assert k > 0, 'frequency_multiple k must be > 0'
 
-    
     if weight_matrix == 'W_E':
         W = model.embed.W_E.detach().cpu()                      # shape (d_model, d_vocab)
         W = W[:,:-1]                                            # shape (d_model, P)
@@ -374,8 +375,152 @@ def inspect_attention_maps_periodic_nature(
         ax.set_xlabel('Frequency (k)')
         ax.set_facecolor(BACKGROUND_COLOR)
 
-    plt.suptitle('Relative Norm of Attention Map (Last Row) Fourier Coefficients (by head)', fontsize=10)
+    plt.suptitle(
+        'Relative Norm of Attention Map (Last Row) Fourier Coefficients (by head)',
+        fontsize=10
+    )
     plt.show()
+
+def inspect_attention_outputs(
+        model: Transformer,
+        plot_line: bool = False,
+        line_gradient: bool = False,
+):
+    """
+    Try to find the petal shaped outputs in Head 1
+    """
+    # Create sample pairs
+    P = 113
+    x = 70
+    y = list(range(P))
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
+    print(f'\n🔍 Inspecting attn maps for periodic nature for pairs: {sample_pairs}...')
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    # Forward pass and collect the activations (attn only)
+    model.eval()
+    z_values_by_head = {}
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+
+        z_values = cache['blocks.0.attn.hook_z']
+        # Expect this to have shape (b, num_heads, num_tokens=3, d_head)
+
+        _, num_heads, _, _ = z_values.shape
+        for i in range(num_heads):
+            z_values_by_head[f'head_{i}'] = z_values[:,i,:,:]
+
+    # I still need the fourier coeff basis from W_E for k=4:
+    W = model.embed.W_E.detach().cpu()                      # shape (d_model, d_vocab)
+    W = W[:,:-1]                                            # shape (d_model, P)
+    fourier_coeffs = get_fourier_coeffs_by_hand(W, P)
+
+    # Because we want to extract those 2 dimensions of the embeddings, then
+    # apply W_V to it
+    head_i = 3
+    k = 4
+    basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]      # shape (d_model, 2)
+    basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+    basis_vecs /= basis_vecs_norm                                           # shape (d_model, 2)
+
+    # We previously got magnitude w.r.t basis_vecs by doing feats @ basis_vecs,
+    # which is (P, d_model) @ (d_model, 2) = (P, 2),
+    # So now, because v = feats @ W_V,
+    # which is (P, d_head) = (P, d_model) @ (d_model, d_head),
+    # we have feats @ basis_vecs = feats @ W_V @ new_basis
+    # => basis_vecs = W_V @ new_basis
+    # => new_basis = np.linalg.pinv(W_V) @ basis_vecs, where pinv is just inv(W_V.T @ W_V) @ W_V.T
+    W_V = model.blocks[0].attn.W_V.detach().cpu()           # shape (num_heads, d_head, d_model)
+    W_V_this_head = W_V[head_i,:,:]                         # shape (d_head, d_model)
+    W_V_this_head = W_V_this_head.T                         # shape (d_model, d_head)
+    W_V_this_head_inv = torch.inverse(W_V_this_head.T @ W_V_this_head)
+    W_V_pinv = W_V_this_head_inv @ W_V_this_head.T          # shape (d_head, d_model)
+    new_basis = W_V_pinv @ basis_vecs                       # shape (d_head, 2)
+
+
+    # Plot
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 5))
+    # if isinstance(axs, plt.Axes):
+    #     axs = np.array(axs)
+    # axs = axs.flatten()
+    cmap = plt.get_cmap('coolwarm', 7)
+
+    z_values_this_head = z_values_by_head[f'head_{head_i}'] # shape (b, num_tokens, d_head)
+    # Only want to focus on the `=` token
+    z_values_this_head = z_values_this_head[:,-1,:]         # shape (b, d_head)
+    
+    z_values_projected = (z_values_this_head @ new_basis).numpy()
+    b1_mag = z_values_projected[:,0]
+    b2_mag = z_values_projected[:,1]
+
+    # Scatter plot
+    # colors = [plt.get_cmap('coolwarm', 113)(i) for i in range(P)]
+    if plot_line:
+        for ax in [axes[1], axes[2]]:
+            # smooth interpolation
+            # Create a parametric variable
+            t = np.arange(len(b1_mag))
+
+            # Create spline interpolations
+            spl_b1 = make_interp_spline(t, b1_mag, k=3)  # k=3 for cubic spline
+            spl_b2 = make_interp_spline(t, b2_mag, k=3)
+
+            # Generate more points for smoother curve
+            num_points = 1000
+            t_smooth = np.linspace(t.min(), t.max(), num_points)
+            b1_smooth = spl_b1(t_smooth)
+            b2_smooth = spl_b2(t_smooth)
+
+            if line_gradient:
+                # make a color gradient line
+                points = np.array([b1_smooth, b2_smooth]).T.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                # Create color array based on position along the curve
+                num_points = len(b1_smooth)
+                cmap = plt.get_cmap('coolwarm', num_points)
+                colors = cmap(np.linspace(0, 1, len(segments)))
+
+                # Create LineCollection
+                lc = mc.LineCollection(segments, colors=colors, linewidth=1.0, alpha=0.6)
+                ax.add_collection(lc)
+            else:
+                ax.plot(b1_smooth, b2_smooth, '-', linewidth=1.0, alpha=0.2)
+    for ax, s in zip([axes[0], axes[2]], [50, 20]):
+        ax.scatter(b1_mag, b2_mag, color=cmap(2), s=s, alpha=0.9)
+
+
+    # Annotate each point with its index
+    # for p in range(P):
+    #     ax.annotate(
+    #         str(p),
+    #         (b1_mag[p], b2_mag[p]),
+    #         fontsize=8,
+    #         alpha=0.7,
+    #         xytext=(3, 3),
+    #         textcoords='offset points'
+    #     )
+
+    for ax in axes:
+        Z = 0.5
+        beautify_ax(
+            ax,
+            xmin=-Z,
+            xmax=Z,
+            ymin=-Z,
+            ymax=Z
+        )
+    plt.show()
+
 
 
 if __name__ == '__main__':
@@ -387,5 +532,6 @@ if __name__ == '__main__':
     train_pairs, test_pairs = load_data(DATA_FILE)
     # inspect_periodic_nature(model, weight_matrix='W_L', do_DFT_by_hand=True)
     # inspect_PCA_W_E(model, weight_matrix='W_L', k_vals=[4, 32, 43])
-    inspect_attention_maps(model, test_pairs, num_samples=6, show_only_last_attn_row=True)
+    # inspect_attention_maps(model, test_pairs, num_samples=6, show_only_last_attn_row=True)
     # inspect_attention_maps_periodic_nature(model)
+    inspect_attention_outputs(model, plot_line=True)
