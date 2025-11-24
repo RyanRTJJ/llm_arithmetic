@@ -131,6 +131,7 @@ class Attention(nn.Module):
         # Hooks
         self.hook_attn = HookPoint()
         self.hook_z = HookPoint()       # Caches the mixed v vectors
+        self.hook_o = HookPoint()       # Caches the out-projected z vectors
 
     def forward(self, x: torch.Tensor):
         """
@@ -153,7 +154,7 @@ class Attention(nn.Module):
         # rmb that v is shape (batch, num_heads, num_tokens, d_head)
         z = self.hook_z(torch.einsum('biph,biqp->biqh', v, attn_matrix))
         z_flat = einops.rearrange(z, 'b i q h -> b q (i h)')
-        out = torch.einsum('df,bqf->bqd', self.W_O, z_flat)
+        out = self.hook_o(torch.einsum('df,bqf->bqd', self.W_O, z_flat))
         return out
 
 class MLP(nn.Module):

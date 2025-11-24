@@ -82,9 +82,9 @@ def do_curve_thingy_animation():
         # Initialize plot elements
         point_a, = ax.plot([], [], 'o', color=cmap(2), markersize=12, label='a', zorder=5)
         point_b, = ax.plot([], [], 'o', color=cmap(5), markersize=12, label='b', zorder=5)
-        point_o, = ax.plot([], [], 'ko', markersize=10, label='o', zorder=5)
+        point_o, = ax.plot([], [], 'ko', markersize=10, label='z', zorder=5)
         line_ab, = ax.plot([], [], '-', color='grey', linewidth=1, alpha=0.5)
-        trajectory, = ax.plot([], [], '-', color='grey', linewidth=1.5, alpha=1.0, label='trajectory of o')
+        trajectory, = ax.plot([], [], '-', color='grey', linewidth=1.5, alpha=1.0, label='trajectory of z')
 
         # Text for displaying alpha value
         alpha_text = ax.text(
@@ -261,9 +261,9 @@ def do_family_of_curves(
 
         # Initialize trajectory line
         if plot_scatter:
-            trajectory = ax.scatter([], [], s=50, color=cmap(2), alpha=0.6, label='trajectory of o')
+            trajectory = ax.scatter([], [], s=50, color=cmap(2), alpha=0.6, label='trajectory of z')
         else:
-            trajectory, = ax.plot([], [], '-', color='grey', linewidth=1.5, label='trajectory of o')
+            trajectory, = ax.plot([], [], '-', color='grey', linewidth=1.5, label='trajectory of z')
 
         # Text for displaying alpha offset value
         offset_text = ax.text(
@@ -396,13 +396,17 @@ if __name__ == '__main__':
 
     # ALPHA_FREQS = [1./8, 4. / 43, 2.0, 8.0]
     # NUM_PERIODSS = [4.0, 43. / 4., 3.0, 8.0]
-    ALPHA_FREQS = [1.0, 8.0]
-    NUM_PERIODSS = [1.0, 8.0]
+
+    # ALPHA_FREQS = [1.0, 8.0]
+    # NUM_PERIODSS = [1.0, 8.0]
+
+    ALPHA_FREQS = [0.25, 1./3, 1.0, 1.50,]
+    NUM_PERIODSS = [2., 3., 2., 3.,]
     do_family_of_curves(
-        circle_freq = 1.0,
+        circle_freq = 0.5,
         alpha_freqs = ALPHA_FREQS,
         num_periodss = NUM_PERIODSS,
-        do_animation = False,
+        do_animation = True,
         alpha_period_offsets = [0.0, 0.0, 0.0, 0.0],
         plot_scatter = False,
         num_trajectory_samples = 1000

@@ -6,10 +6,13 @@ from pathlib import Path
 import pickle
 import random
 
+import einops
 import matplotlib.pyplot as plt
 import matplotlib.collections as mc
+from matplotlib.colors import Normalize
 import numpy as np
 from scipy.interpolate import make_interp_spline
+from scipy.linalg import subspace_angles
 import torch
 from torch.utils.data import DataLoader
 
@@ -20,6 +23,44 @@ from grokking_model import Transformer
 # | utils |
 # +-------+
 BACKGROUND_COLOR = '#FCFBF8'
+O_PROJECTED_SAVE_LOC = 'o_values_projected_grokked_20k_k_{k}.npz'
+
+def draw_line(ax, v1, v2, line_kwargs):
+    """
+    @param v1, v2:      np.ndarrays of shape (dim,)
+    """
+    assert v1.shape == v2.shape, f'v1 and v2 need to have same shape, got {v1.shape} vs. {v2.shape}'
+    if v1.shape[0] == 2:
+        vector_line = np.stack((v1, v2), axis=0)[None,:,:]
+        ax.add_collection(
+            mc.LineCollection(
+                vector_line,
+                **line_kwargs
+            )
+        )
+    else:
+        assert v1.shape[0] == 3, 'draw_line takes v1 and v2 that are either 2 or 3 dimensional'
+        x_values = [v1[0], v2[0]]
+        y_values = [v1[1], v2[1]]
+        z_values = [v1[2], v2[2]]
+        ax.plot(x_values, y_values, z_values, **line_kwargs)
+
+def draw_vector(ax, v, scatter_kwargs, line_kwargs, origin: np.ndarray | None = None):
+    """
+    @param v:       np.ndarray of shape (dim,)
+    """
+    if origin is None:
+        origin = np.zeros_like(v)
+
+    # draw the point
+    if v.shape[0] == 2:
+        ax.scatter(v[0], v[1], **scatter_kwargs)
+    else:
+        assert v.shape[0] == 3, f'v must be 2 or 3-dimensional. got {v.shape[0]}'
+        ax.scatter(v[0], v[1], v[2], **scatter_kwargs)
+
+    # the stem of the vector
+    draw_line(ax, origin, v, line_kwargs)
 
 def beautify_ax(ax: plt.Axes, xmin: float, xmax: float, ymin: float, ymax: float, ignore_aspect_ratio=False):
     ax.set_facecolor(BACKGROUND_COLOR)
@@ -36,7 +77,7 @@ def load_model(checkpoint_file: Path) -> Transformer:
     Given a `.pt` / `.pth` file, loads the model checkpoint and returns it
     """
     model = Transformer()
-    chkpt_dict = torch.load(checkpoint_file)
+    chkpt_dict = torch.load(checkpoint_file, weights_only=False)
     model_state_dict = chkpt_dict['model_state_dict']
     model.load_state_dict(model_state_dict)
 
@@ -381,10 +422,13 @@ def inspect_attention_maps_periodic_nature(
     )
     plt.show()
 
-def inspect_attention_outputs(
+def inspect_attention_z_values(
         model: Transformer,
-        plot_line: bool = False,
+        head_i: int,
+        k: int,
+        plot_interpolation: bool = False,
         line_gradient: bool = False,
+        annotate_scatter: bool = False,
 ):
     """
     Try to find the petal shaped outputs in Head 1
@@ -396,7 +440,6 @@ def inspect_attention_outputs(
     sample_pairs = [(x, _y, P) for _y in y]
 
     num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
-    print(f'\n🔍 Inspecting attn maps for periodic nature for pairs: {sample_pairs}...')
 
     # Make the dataloader (full batch)
     sample_dataset = MyDataset(sample_pairs)
@@ -427,8 +470,12 @@ def inspect_attention_outputs(
 
     # Because we want to extract those 2 dimensions of the embeddings, then
     # apply W_V to it
-    head_i = 3
-    k = 4
+    ATTN_HEAD_TO_FREQ_TEXT = {
+        0: '43 Hz (mostly), with some 4 Hz and small amounts of 27 Hz, 32 Hz, 47 Hz',
+        1: '4 Hz',
+        2: '43 Hz (mostly), with some 4 Hz',
+        3: '32 Hz (mostly), with some 4 Hz'
+    }
     basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]      # shape (d_model, 2)
     basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
     basis_vecs /= basis_vecs_norm                                           # shape (d_model, 2)
@@ -447,12 +494,11 @@ def inspect_attention_outputs(
     W_V_pinv = W_V_this_head_inv @ W_V_this_head.T          # shape (d_head, d_model)
     new_basis = W_V_pinv @ basis_vecs                       # shape (d_head, 2)
 
-
     # Plot
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 5))
-    # if isinstance(axs, plt.Axes):
-    #     axs = np.array(axs)
-    # axs = axs.flatten()
+    if plot_interpolation:
+        fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 7))
+    else:
+        fix, ax = plt.subplots(1, 1, figsize=(6, 6))
     cmap = plt.get_cmap('coolwarm', 7)
 
     z_values_this_head = z_values_by_head[f'head_{head_i}'] # shape (b, num_tokens, d_head)
@@ -465,8 +511,10 @@ def inspect_attention_outputs(
 
     # Scatter plot
     # colors = [plt.get_cmap('coolwarm', 113)(i) for i in range(P)]
-    if plot_line:
-        for ax in [axes[1], axes[2]]:
+    if plot_interpolation:
+        axes_with_scatters = [axes[0], axes[1]]
+        axes_with_interpolation = [axes[1], axes[2]]
+        for ax in axes_with_interpolation:
             # smooth interpolation
             # Create a parametric variable
             t = np.arange(len(b1_mag))
@@ -495,22 +543,42 @@ def inspect_attention_outputs(
                 ax.add_collection(lc)
             else:
                 ax.plot(b1_smooth, b2_smooth, '-', linewidth=1.0, alpha=0.2)
-    for ax, s in zip([axes[0], axes[2]], [50, 20]):
-        ax.scatter(b1_mag, b2_mag, color=cmap(2), s=s, alpha=0.9)
 
+        # Do scatter
+        for ax, s in zip(axes_with_scatters, [30, 30]):
+            ax.scatter(b1_mag, b2_mag, color=cmap(2), s=s, alpha=0.9)
 
-    # Annotate each point with its index
-    # for p in range(P):
-    #     ax.annotate(
-    #         str(p),
-    #         (b1_mag[p], b2_mag[p]),
-    #         fontsize=8,
-    #         alpha=0.7,
-    #         xytext=(3, 3),
-    #         textcoords='offset points'
-    #     )
+        if annotate_scatter:
+            # Annotate each point with its index
+            for p in range(P):
+                axes_with_scatters[0].annotate(
+                    str(p),
+                    (b1_mag[p], b2_mag[p]),
+                    fontsize=6,
+                    alpha=0.5,
+                    xytext=(3, 3),
+                    textcoords='offset points'
+                )
 
-    for ax in axes:
+        # Beautiful
+        for i, ax in enumerate(axes):
+            Z = 0.5
+            beautify_ax(
+                ax,
+                xmin=-Z,
+                xmax=Z,
+                ymin=-Z,
+                ymax=Z
+            )
+            if i == 0:
+                ax_title = 'z values'
+            elif i == 1:
+                ax_title = 'z values with smoothing splines interpolation'
+            else:
+                ax_title = 'interpolation pattern only'
+            ax.set_title(ax_title, fontsize=10)
+    else:
+        ax.scatter(b1_mag, b2_mag, color=cmap(2), s=50, alpha=0.9)
         Z = 0.5
         beautify_ax(
             ax,
@@ -519,8 +587,665 @@ def inspect_attention_outputs(
             ymin=-Z,
             ymax=Z
         )
+        title_text = (
+            f'$\\bf{{z\ values\ for:}}$\n'
+            f"  - attn head {head_i}, with periodicity: {ATTN_HEAD_TO_FREQ_TEXT[head_i]}\n"
+            f"  - in 2D subspace corresponding to the freq {k} Hz circle"
+        )
+        ax.set_title(title_text, loc='left', fontsize=10)
+
+
     plt.show()
 
+def compute_pinv_by_hand(W: torch.Tensor):
+    """
+    Helper function
+    """
+    height, width = W.shape
+    if height > width:
+        # tall
+        inv = torch.inverse(W.T @ W)
+        pinv = inv @ W.T
+    else:
+        # wide
+        inv = torch.inverse(W @ W.T)
+        pinv = W.T @ inv
+    return pinv
+
+def get_interpolation(
+        points: np.ndarray,
+        num_points: int = 1000,
+        degree: int = 3,
+        return_line_collection: bool = False
+    ):
+    """
+    Helper function
+
+    @param points:      (n, 2) array of points to interpolate
+    @param num_points:  smoothness. The higher the better but more expensive.
+    @param degree:      Of polynomial of spline. Default 3 for cubic splines.
+    """
+    n, d = points.shape
+    assert d == 2, 'get_interpolation not implemented for non-2d points'
+
+    # Create a parametric variable
+    t = np.arange(n)
+
+    # Create spline interpolations
+    spl_b1 = make_interp_spline(t, points[:,0], k=degree)  # k = 3 for cubic spline
+    spl_b2 = make_interp_spline(t, points[:,1], k=degree)
+
+    # Generate more points for smoother curve
+    num_points = 1000
+    t_smooth = np.linspace(t.min(), t.max(), num_points)
+    b1_smooth = spl_b1(t_smooth)
+    b2_smooth = spl_b2(t_smooth)
+
+    if return_line_collection:
+        # make a color gradient line
+        vertices = points.T.reshape(-1, 1, 2)
+        segments = np.concatenate([vertices[:-1], vertices[1:]], axis=1)
+        # Create color array based on position along the curve
+        cmap = plt.get_cmap('coolwarm', num_points)
+        colors = cmap(np.linspace(0, 1, len(segments)))
+
+        # Create LineCollection
+        lc = mc.LineCollection(segments, colors=colors, linewidth=1.0, alpha=0.6)
+        return lc
+    else:
+        result = np.hstack([b1_smooth[:,None], b2_smooth[:,None]])
+        return result
+
+
+def inspect_attention_outputs(
+        model: Transformer,
+        head_i: int,
+        k: int,
+        plot_interpolation: bool = False,
+        line_gradient: bool = False,
+        annotate_scatter: bool = False,
+):
+    """
+    Try to find the petal shaped outputs we found in z-space in o-space as well
+    """
+    # Create sample pairs
+    P = 113
+    x = 70
+    y = list(range(P))
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    # Forward pass and collect the activations
+    model.eval()
+    z_values_by_head = {}
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+
+        z_values = cache['blocks.0.attn.hook_z']
+        # Expect this to have shape (b, num_heads, num_tokens=3, d_head)
+
+        _, num_heads, _, _ = z_values.shape
+        for i in range(num_heads):
+            z_values_by_head[f'head_{i}'] = z_values[:,i,:,:]
+
+    # I still need the fourier coeff basis from W_E for k=4:
+    W = model.embed.W_E.detach().cpu()                      # shape (d_model, d_vocab)
+    W = W[:,:-1]                                            # shape (d_model, P)
+    fourier_coeffs = get_fourier_coeffs_by_hand(W, P)
+
+    # Because we want to extract those 2 dimensions of the embeddings, then
+    # apply W_V to it
+    basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]      # shape (d_model, 2)
+    basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+    basis_vecs /= basis_vecs_norm                                           # shape (d_model, 2)
+
+    # Calculate the basis transformation that would allow us to visualize in 2D
+    W_V = model.blocks[0].attn.W_V.detach().cpu()           # shape (num_heads, d_head, d_model)
+    W_V_this_head = W_V[head_i,:,:]                         # shape (d_head, d_model)
+    W_V_this_head = W_V_this_head.T                         # shape (d_model, d_head)
+    W_V_pinv = compute_pinv_by_hand(W_V_this_head)          # shape (d_head, d_model)
+
+    num_heads, d_head, d_model = W_V.shape
+    W_O = model.blocks[0].attn.W_O.detach().cpu()                   # shape (d_model, num_heads * d_head)
+    W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head]  # shape (d_model, d_head)
+    W_O_this_head = W_O_this_head.T                                 # shape (d_head, d_model)
+    W_O_pinv = compute_pinv_by_hand(W_O_this_head)                  # shape (d_model, d_head)
+
+    WV_WO_pinv = W_O_pinv @ W_V_pinv                                # shape (d_model, d_model)
+    new_basis = WV_WO_pinv @ basis_vecs                             # shape (d_model, 2)
+
+    z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
+    o_values_this_head = z_values_this_head @ W_O_this_head         # shape (b, num_tokens, d_model)
+    # Only want to focus on the `=` token
+    o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
+    print(f'o_values_this_head.shape: {o_values_this_head.shape}')
+    
+    o_values_projected = (o_values_this_head @ new_basis).numpy()
+    b1_mag = o_values_projected[:,0]
+    b2_mag = o_values_projected[:,1]
+
+    # Plot
+    if plot_interpolation:
+        fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 7))
+    else:
+        fix, ax = plt.subplots(1, 1, figsize=(6, 6))
+    cmap = plt.get_cmap('coolwarm', 7)
+
+    # Scatter plot
+    Z = 0.5
+    if plot_interpolation:
+        axes_with_scatters = [axes[0], axes[1]]
+        axes_with_interpolation = [axes[1], axes[2]]
+        for ax in axes_with_interpolation:
+            if line_gradient:
+                lc = get_interpolation(
+                    o_values_projected,
+                    return_line_collection=True
+                )
+                ax.add_collection(lc)
+            else:
+                projected_smooth = get_interpolation(o_values_projected)
+                ax.plot(projected_smooth[:,0], projected_smooth[:,1], '-', linewidth=1.0, alpha=0.2)
+
+        # Do scatter
+        for ax, s in zip(axes_with_scatters, [30, 30]):
+            ax.scatter(b1_mag, b2_mag, color=cmap(2), s=s, alpha=0.9)
+        
+        if annotate_scatter:
+            # Annotate each point with its index
+            for p in range(P):
+                axes_with_scatters[0].annotate(
+                    str(p),
+                    (b1_mag[p], b2_mag[p]),
+                    fontsize=8,
+                    alpha=0.6,
+                    xytext=(3, 3),
+                    textcoords='offset points'
+                )
+
+        # Beautiful
+        for i, ax in enumerate(axes):
+            beautify_ax(
+                ax,
+                xmin=-Z,
+                xmax=Z,
+                ymin=-Z,
+                ymax=Z
+            )
+            if i == 0:
+                ax_title = 'z values'
+            elif i == 1:
+                ax_title = 'z values with smoothing splines interpolation'
+            else:
+                ax_title = 'interpolation pattern only'
+            ax.set_title(ax_title, fontsize=10)
+    else:
+        ax.scatter(b1_mag, b2_mag, color=cmap(2), s=50, alpha=0.9)
+        # print(len(b1_mag))
+        beautify_ax(
+            ax,
+            xmin=-Z,
+            xmax=Z,
+            ymin=-Z,
+            ymax=Z
+        )
+
+    plt.show()
+
+def inspect_attention_outputs_in_agg(
+        model: Transformer,
+        k: int,
+        plot_interpolation: bool = False,
+        annotate_scatter: bool = False,
+        o_projected_save_loc: str = '',
+):
+    """
+    Plots each head's contribution to the 2d space where the original
+    frequency-`k` embedding circles were found
+    """
+    # Create sample pairs
+    P = 113
+    x = 70
+    y = list(range(P))
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    # Forward pass and collect the activations
+    model.eval()
+    z_values_by_head = {}
+    o_values_cached = None
+    o_values_by_head = {}
+    num_heads = None
+
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+
+        z_values = cache['blocks.0.attn.hook_z']        # (b, num_heads, num_tokens, d_head)
+        o_values_cached = cache['blocks.0.attn.hook_o']        # (b, num_tokens, d_model)
+
+        _, num_heads, _, _ = z_values.shape
+        for i in range(num_heads):
+            z_values_by_head[f'head_{i}'] = z_values[:,i,:,:]
+
+    # I still need the fourier coeff basis from W_E for k=4:
+    W = model.embed.W_E.detach().cpu()                      # shape (d_model, d_vocab)
+    W = W[:,:-1]                                            # shape (d_model, P)
+    fourier_coeffs = get_fourier_coeffs_by_hand(W, P)
+
+    # Because we want to extract those 2 dimensions of the embeddings, then
+    # apply W_V to it
+    basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]      # shape (d_model, 2)
+    basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+    basis_vecs /= basis_vecs_norm                                           # shape (d_model, 2)
+
+    fig, axes = plt.subplots(nrows=2, ncols=num_heads + 1, figsize=(14, 6))
+    SCATTER_SIZE = 20
+    SCATTER_ALPHA = 0.7
+    cmap = plt.get_cmap('coolwarm', 7)
+    Z = 0.55
+    # Calculate the basis transformation that would allow us to visualize in 2D
+    o_projected_by_head = {}
+    for head_i in range(num_heads + 1):
+        scatter_ax = axes[0,head_i]
+        interpolation_ax = axes[1,head_i]
+
+        if head_i < num_heads:
+            W_V = model.blocks[0].attn.W_V.detach().cpu()           # shape (num_heads, d_head, d_model)
+            W_V_this_head = W_V[head_i,:,:]                         # shape (d_head, d_model)
+            W_V_this_head = W_V_this_head.T                         # shape (d_model, d_head)
+            W_V_pinv = compute_pinv_by_hand(W_V_this_head)          # shape (d_head, d_model)
+
+            num_heads, d_head, d_model = W_V.shape
+            W_O = model.blocks[0].attn.W_O.detach().cpu()                   # shape (d_model, num_heads * d_head)
+            W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head]  # shape (d_model, d_head)
+            W_O_this_head = W_O_this_head.T                                 # shape (d_head, d_model)
+            W_O_pinv = compute_pinv_by_hand(W_O_this_head)                  # shape (d_model, d_head)
+
+            WV_WO_pinv = W_O_pinv @ W_V_pinv                                # shape (d_model, d_model)
+            new_basis = WV_WO_pinv @ basis_vecs                             # shape (d_model, 2)
+
+            z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
+            o_values_this_head = z_values_this_head @ W_O_this_head         # shape (b, num_tokens, d_model)
+            # Only want to focus on the `=` token
+            o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
+            print(f'o_values_this_head.shape: {o_values_this_head.shape}')
+        
+            o_values_projected = (o_values_this_head @ new_basis).numpy()
+            o_projected_by_head[head_i] = o_values_projected
+            b1_mag = o_values_projected[:,0]
+            b2_mag = o_values_projected[:,1]
+            color = cmap(2)
+            ax_title = f'attn head {head_i} only'
+        else:
+            # Overall
+            use_correct_method = True
+            if not use_correct_method:
+                # This logic doesn't have to be here. I just kept it because I have yet
+                # to understand why this is different from 'use_correct_method' logic.
+                # Why doesn't this work?
+                W_V = model.blocks[0].attn.W_V.detach().cpu()           # shape (num_heads, d_head, d_model)
+                W_V = einops.rearrange(W_V, 'i h d -> (i h) d')         # shape (num_heads * d_head, d_model)
+                W_V = W_V.T                                             # shape (d_model, num_heads * d_head)
+
+                W_O = model.blocks[0].attn.W_O.detach().cpu()           # shape (d_model, num_heads * d_head)
+                W_O = W_O.T                                             # shape (num_heads * d_head, d_model)
+
+                # Alt calculation
+                WV_WO = W_V @ W_O                                       # shape (d_model, d_model)
+                WV_WO_pinv = torch.inverse(WV_WO)
+                # WV_WO_pinv = W_O_pinv @ W_V_pinv                        # shape (d_model, d_model)
+                new_basis = WV_WO_pinv @ basis_vecs
+
+                # Only want to focus on the `=` token
+                o_values = o_values_cached[:,-1,:]                      # shape (P, d_model)
+                o_values_projected = (o_values @ new_basis).numpy()     # shape (P, 2)
+                print(o_values_projected)
+            
+                Z = 10.0
+            else:
+                # This should work
+                o_values_projected = np.vstack([projected[None,:,:] for projected in o_projected_by_head.values()])
+                o_values_projected = np.sum(o_values_projected, axis=0)
+
+                # Save this
+                if o_projected_save_loc:
+                    np.savez(
+                        o_projected_save_loc,
+                        o_projected=o_values_projected,
+                        o=o_values_cached[:,-1,:]
+                    )
+                    print(f'✅ o_values_projected saved in {O_PROJECTED_SAVE_LOC}')
+
+            b1_mag = o_values_projected[:,0]
+            b2_mag = o_values_projected[:,1]
+            Z = 2.0
+            color = cmap(5)
+            ax_title = 'overall / summed'
+
+        # Do scatter
+        scatter_ax.scatter(b1_mag, b2_mag, color=color, s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
+        scatter_ax.set_title(ax_title, fontsize=10)
+
+        # Do interpolation
+        projected_smooth = get_interpolation(o_values_projected, degree=3)
+        interpolation_ax.plot(
+            projected_smooth[:,0], projected_smooth[:,1], '-', color=color, linewidth=1.0, alpha=0.4
+        )
+
+        for ax in [scatter_ax, interpolation_ax]:
+            beautify_ax(
+                ax,
+                xmin=-Z,
+                xmax=Z,
+                ymin=-Z,
+                ymax=Z
+            )
+
+    plt.suptitle(
+        f'$\\bf{{o\ vectors}}$\nin 2D subspace corresponding to freq {k} Hz embedding circle',
+        fontsize=11
+    )
+    plt.show()
+
+def inspect_attention_outputs_periodic_nature(
+        model: Transformer,
+        o_dict: dict[str, np.ndarray],
+        do_projected: bool = True,
+):
+    """
+    Do fourier analysis of o_projected to see if it's really a nice frequency k circle
+
+    @param do_projected:    Whether to fourier analyze the projected o or overall o embeddings
+    """
+    o_projected = o_dict['o_projected']
+    o = o_dict['o']
+
+    if do_projected:
+        o_values = o_projected
+    else:
+        o_values = o
+
+    P, d_model = o_values.shape
+    o_values = torch.Tensor(o_values.T)
+
+    fourier_coeffs = get_fourier_coeffs_by_hand(o_values, P)
+    fourier_coeff_norms = fourier_coeffs.norm(dim=0)
+
+    _, ax = plt.subplots(1, 1, figsize=(12, 4))
+    cmap = plt.get_cmap('coolwarm', 7)
+
+    x_axis = np.linspace(1, P, P - 1)
+    x_ticks = [i for i in range(0, P, 10)]
+    x_tick_labels = [i // 2 for i in range(0, P, 10)]
+
+    colors = [cmap(2) if i % 2 == 0 else cmap(5) for i in range(P)]
+    ax.bar(x_axis, fourier_coeff_norms[1:], width=0.6, color=colors)
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_tick_labels)
+
+    ax.set_ylabel('Relative Norm of Coefficients')
+    ax.set_xlabel('Frequency multiple (k)')
+    ax.set_facecolor(BACKGROUND_COLOR)
+    plt.show()
+
+def get_attn_output_circle_bases(
+        o_dict: dict[str, np.ndarray],
+        k_values: list[int] = [4, 32, 43],
+):
+    o_values = o_dict['o']
+
+    P, d_model = o_values.shape
+    o_values = torch.Tensor(o_values.T)
+
+    fourier_coeffs = get_fourier_coeffs_by_hand(o_values, P)
+
+    k_to_basis_vecs = {}
+
+    for k in k_values:
+        basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]
+        basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+        basis_vecs /= basis_vecs_norm    # shape (d_model, 2)
+
+        k_to_basis_vecs[k] = basis_vecs.numpy()
+
+    return k_to_basis_vecs
+
+def get_WE_circle_bases(
+        W_E: np.ndarray | torch.Tensor,
+        k_values: list[int] = [4, 32, 43],
+):
+    b, P = W_E.shape
+    fourier_coeffs = get_fourier_coeffs_by_hand(W_E, P)
+
+    k_to_embedding_basis_vecs = {}
+    for idx, k in enumerate(k_values):
+        basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]
+        basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+        basis_vecs /= basis_vecs_norm    # shape (d_model, 2)
+        k_to_embedding_basis_vecs[k] = basis_vecs
+    return k_to_embedding_basis_vecs
+
+def visualize_o_circles(
+        o_dict: dict[str, np.ndarray],
+):
+    """
+    More of just a sanity check
+    """
+    K_VALUES = [4, 32, 43]
+    k_to_basis_vecs = get_attn_output_circle_bases(
+        o_dict=o_dict,
+        k_values=K_VALUES,
+    )
+
+    o_values = o_dict['o']      # shape (P, d_model)
+    P, d_model = o_values.shape
+
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(12, 6))
+    # cmap = plt.get_cmap('coolwarm', 7)
+    Z = 7.0
+    for i, k in enumerate(K_VALUES):
+        ax = axes[i]
+
+        basis_vecs = k_to_basis_vecs[k]
+        o_values_projected = o_values @ basis_vecs
+        o_values_projected = o_values_projected
+
+        # Scatter plot
+        # We do milli_periods because cmaps can't give us decimal periods
+        milli_period = int(1000 * P / k)
+        cmap = plt.get_cmap('coolwarm', milli_period)
+        colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+        ax.scatter(o_values_projected[:,0], o_values_projected[:,1], color=colors, s=50, alpha=0.7)
+
+        beautify_ax(
+            ax,
+            xmin=-Z,
+            xmax=Z,
+            ymin=-Z,
+            ymax=Z
+        )
+        ax.set_xlabel('PC 1')
+        ax.set_ylabel('PC 2')
+        ax.set_title(
+            f'Fourier Coeffs for {k} Hz ',
+            fontsize=10
+        )
+    plt.suptitle(f'$\\bf{{o\ vectors\ in\ 2D\ Subspace\ Corresponding\ To:}}$', fontsize=11)
+    plt.show()
+
+def do_WE_and_o_coexist(
+        model: Transformer,
+        o_dict: dict[str, np.ndarray],
+        k_values: list[int] = [4, 32, 43],
+):
+    """
+    Finds the basis vectors for the o vectors as well as the W_E vectors
+    """
+    k_to_o_basis_vecs = get_attn_output_circle_bases(
+        o_dict=o_dict,
+        k_values=k_values,
+    )
+
+    o_values = o_dict['o']      # shape (P, d_model)
+    P, d_model = o_values.shape
+
+    W_E = model.embed.W_E.detach().cpu()                    # shape (d_model, d_vocab)
+    W_E = W_E[:,:-1]                                        # shape (d_model, P)
+
+    k_to_embedding_basis_vecs = get_WE_circle_bases(
+        W_E=W_E,
+        k_values=k_values,
+    )
+
+    num_k_values = len(k_values)
+    subspace_angles_grid = np.zeros((num_k_values, num_k_values))
+
+    for i in range(num_k_values):
+        ki = k_values[i]
+        for j in range(num_k_values):
+            kj = k_values[j]
+            o_basis_vecs = k_to_o_basis_vecs[ki]
+            e_basis_vecs = k_to_embedding_basis_vecs[kj]
+
+            angles = subspace_angles(o_basis_vecs, e_basis_vecs)
+            angles_deg = np.degrees(angles)
+            dihedral_angle_deg = angles_deg[1]
+            subspace_angles_grid[i,j] = dihedral_angle_deg
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    im = ax.imshow(subspace_angles_grid, cmap='coolwarm', vmin=-90., vmax=90.)
+
+    # Add text annotations to each cell
+    for i in range(num_k_values):
+        for j in range(num_k_values):
+            angle = subspace_angles_grid[i, j]
+            text = ax.text(
+                j, i,
+                f'{angle:.1f}°',
+                ha="center",
+                va="center", 
+                color="black" if abs(angle) < 45 else "white",
+                fontsize=10
+            )
+
+    # Add axis labels
+    ax.set_xlabel('basis vectors derived from W_E Fourier Coefficients', fontsize=10)
+    ax.set_ylabel(
+        'basis vectors derived from\no vectors Fourier Coefficients',
+        fontsize=10,
+        rotation=0,
+        ha='right',
+        labelpad=20
+    )
+
+    # Optional: add colorbar
+    plt.colorbar(im, ax=ax, label='Dihedral Angle (°)')
+
+    # Optional: set tick labels if you want to show k_values
+    ax.set_xticks(range(num_k_values))
+    ax.set_yticks(range(num_k_values))
+    ax.set_xticklabels(k_values)
+    ax.set_yticklabels(k_values)
+    plt.show()
+
+def visualize_W_up_PCA(
+        model: Transformer,
+        o_dict: dict[str, np.ndarray],
+        k_values: list[int] = [4, 32, 43],
+):
+    """
+    Finds the basis vectors for the o vectors as well as the W_E vectors
+    """
+    k_to_o_basis_vecs = get_attn_output_circle_bases(
+        o_dict=o_dict,
+        k_values=k_values,
+    )
+
+    o_values = o_dict['o']      # shape (P, d_model)
+    P, d_model = o_values.shape
+
+    W_E = model.embed.W_E.detach().cpu()                    # shape (d_model, d_vocab)
+    W_E = W_E[:,:-1]                                        # shape (d_model, P)
+
+    k_to_embedding_basis_vecs = get_WE_circle_bases(
+        W_E=W_E,
+        k_values=k_values,
+    )
+    # Each basis in each of the above dicts are shape (d_model, 2)
+
+    W_up = model.blocks[0].mlp.W_up.detach().cpu()          # shape (d_mlp, d_model)
+
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 5))
+    cmap = plt.get_cmap('coolwarm', 7)
+    Z = 5.
+    SCATTER_WIDTH = 30
+    LINEWIDTH = 1
+    COLOR = 'darkslategrey'
+    scatter_kwargs = { 's': SCATTER_WIDTH, 'color': COLOR, 'alpha': 0.7 }
+    line_kwargs = { 'linewidth': LINEWIDTH, 'color': COLOR, 'alpha': 0.7 }
+
+    for i, k in enumerate(k_values):
+        ax = axes[i]
+        W_up_projected = W_up @ k_to_o_basis_vecs[k]
+        
+        # Scatter plot: this is really inefficient lol
+        for v in W_up_projected:
+            draw_vector(ax, v, scatter_kwargs, line_kwargs)
+
+        beautify_ax(
+            ax,
+            xmin=-Z,
+            xmax=Z,
+            ymin=-Z,
+            ymax=Z
+        )
+        ax.set_title(
+            f'Fourier Coeffs for {k} Hz ',
+            fontsize=10
+        )
+    
+    plt.suptitle(f'$\\bf{{W\_up\ vectors\ in\ 2D\ Subspace\ Corresponding\ To:}}$', fontsize=11)
+    plt.show()
+
+def profile_b_up(model: Transformer):
+    """
+    What the fuck's up with this MLP? MLP is severely over provisioned.
+    No superposition necessary
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    b = model.blocks[0].mlp.b_up.detach().cpu().numpy()
+    b.sort()
+
+    x_axis = np.arange(len(b))
+
+    # color
+    max_abs_value = max(np.abs(b))
+    norm = Normalize(vmin=-max_abs_value, vmax=max_abs_value)
+    cmap = plt.cm.coolwarm
+    colors = cmap(norm(b))
+
+    ax.bar(x_axis, b, width=1.0, color=colors)
+    ax.set_facecolor(BACKGROUND_COLOR)
+    ax.set_title(f'b_up values sorted', fontsize=10)
+    plt.show()
 
 
 if __name__ == '__main__':
@@ -534,4 +1259,44 @@ if __name__ == '__main__':
     # inspect_PCA_W_E(model, weight_matrix='W_L', k_vals=[4, 32, 43])
     # inspect_attention_maps(model, test_pairs, num_samples=6, show_only_last_attn_row=True)
     # inspect_attention_maps_periodic_nature(model)
-    inspect_attention_outputs(model, plot_line=True)
+
+    # inspect_attention_z_values(
+    #     model,
+    #     head_i=1,
+    #     k=32,
+    #     plot_interpolation=True,
+    #     annotate_scatter=True
+    # )
+
+    # inspect_attention_outputs(
+    #     model,
+    #     head_i=3,
+    #     k=4,
+    #     plot_interpolation=True,
+    #     annotate_scatter=False,
+    # )
+
+    # This saves the o / o_projected vectors used in the next function
+    K = 43
+    # inspect_attention_outputs_in_agg(
+    #     model,
+    #     k = K,
+    #     o_projected_save_loc=O_PROJECTED_SAVE_LOC.format(k=K)
+    # )
+
+    o_dict = np.load(O_PROJECTED_SAVE_LOC.format(k=K))
+    # inspect_attention_outputs_periodic_nature(
+    #     model,
+    #     o_dict,
+    #     do_projected=False
+    # )
+
+    # visualize_o_circles(
+    #     o_dict
+    # )
+
+    # do_WE_and_o_coexist(model, o_dict)
+
+    # visualize_W_up_PCA(model, o_dict)
+
+    profile_b_up(model)
