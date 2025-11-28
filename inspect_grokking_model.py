@@ -278,23 +278,24 @@ def inspect_attention_maps(
         test_pairs: list[tuple[int, int, int]],
         num_samples: int = 2,
         show_only_last_attn_row: bool = True,
+        full_p_by_p_plot: bool = False,
 ):
     """
     Plots the attention maps of all heads on some of the test_pairs.
     """
     # assert num_samples <= 8, 'Give a reasonable number of samples plz.'
     # sample_pairs = random.sample(test_pairs, num_samples)
-
-    x = 42
-    y = [i for i in range(0, 60)]
-    sample_pairs = [(x, _y, 113) for _y in y]
-
-    # y = 70
-    # x = [i for i in range(0, 60)]
-    # sample_pairs = [(_x, y, 113) for _x in x]
+    P = 113
+    if full_p_by_p_plot:
+        sample_pairs = []
+        for x in range(P):
+            for y in range(P):
+                sample_pairs += [(x, y, P)]
+    else:
+        x = 42
+        sample_pairs = [(x, y, P) for y in range(60)]
 
     num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
-    print(f'\n🔍 Inspecting attn maps for pairs: {sample_pairs}...')
 
     # Make the dataloader (full batch)
     sample_dataset = MyDataset(sample_pairs)
@@ -320,36 +321,67 @@ def inspect_attention_maps(
 
     # Plot
     num_heads = len(activations_by_head)
-    fig, axs = plt.subplots(nrows=num_samples, ncols=num_heads, figsize=(4, min(12, 2 * num_samples)))
+
+    if full_p_by_p_plot:
+        fig, axs = plt.subplots(nrows=1, ncols=4, figsize=(16, 6))
+    else:
+        fig, axs = plt.subplots(nrows=num_samples, ncols=num_heads, figsize=(4, min(12, 2 * num_samples)))
 
     for head_i in range(num_heads):
-        head_activations = activations_by_head[f'head_{head_i}']
-        for sample_i, attn_map in enumerate(head_activations):
-            ax = axs[sample_i, head_i]
-            attn_map_np = attn_map.numpy()
+        head_activations = activations_by_head[f'head_{head_i}']    # shape (b, pos, pos)
+        if full_p_by_p_plot:
+            # Record only attention on token `a` in last row
+            attention_on_token_a = head_activations[:,-1,0]
 
-            if show_only_last_attn_row:
-                attn_map_np = attn_map_np[-1,:][None,:]
+            # Reshape
+            attention_on_token_a = attention_on_token_a.reshape(P, P)
 
-            im = ax.imshow(attn_map_np, cmap='coolwarm', vmin=-1, vmax=1)
-            ax.axis('off')
-
+            ax = axs[head_i]
+            ax.imshow(attention_on_token_a, cmap='coolwarm', vmin=-1, vmax=1)
+            
             if head_i == 0:
                 # label row
-                s_pair = sample_pairs[sample_i]
                 ax.text(
                     -0.2,
                     0.5,
-                    f'{s_pair[0]} + {s_pair[1]} =',
+                    'token `a`',
                     transform=ax.transAxes,
-                    fontsize=8,
+                    fontsize=10,
                     ha='right',
                     va='center',
                     rotation=0
                 )
-            if sample_i == 0:
-                ax.set_title(f'Head {head_i}', fontsize=8)
-    
+            ax.set_xlabel('token `b`', fontsize=10)
+            ax.set_title(f'Head {head_i}', fontsize=8)
+
+        else:
+            for sample_i, attn_map in enumerate(head_activations):
+                ax = axs[sample_i, head_i]
+                attn_map_np = attn_map.numpy()
+
+                if show_only_last_attn_row:
+                    attn_map_np = attn_map_np[-1,:][None,:]
+
+                im = ax.imshow(attn_map_np, cmap='coolwarm', vmin=-1, vmax=1)
+                ax.axis('off')
+
+                if head_i == 0:
+                    # label row
+                    s_pair = sample_pairs[sample_i]
+                    ax.text(
+                        -0.2,
+                        0.5,
+                        f'{s_pair[0]} + {s_pair[1]} =',
+                        transform=ax.transAxes,
+                        fontsize=8,
+                        ha='right',
+                        va='center',
+                        rotation=0
+                    )
+                if sample_i == 0:
+                    ax.set_title(f'Head {head_i}', fontsize=8)
+    if full_p_by_p_plot:
+        plt.suptitle(f'Attn score from `=` to `a`', fontsize=11)
     # plt.tight_layout()
     plt.show()
 
@@ -1006,14 +1038,13 @@ def inspect_attention_outputs_periodic_nature(
     ax.set_facecolor(BACKGROUND_COLOR)
     plt.show()
 
-def get_attn_output_circle_bases(
-        o_dict: dict[str, np.ndarray],
+def get_embeddings_circle_bases(
+        embeddings: np.ndarray,
         k_values: list[int] = [4, 32, 43],
 ):
-    o_values = o_dict['o']
 
-    P, d_model = o_values.shape
-    o_values = torch.Tensor(o_values.T)
+    P, d = embeddings.shape
+    o_values = torch.Tensor(embeddings.T)
 
     fourier_coeffs = get_fourier_coeffs_by_hand(o_values, P)
 
@@ -1050,8 +1081,8 @@ def visualize_o_circles(
     More of just a sanity check
     """
     K_VALUES = [4, 32, 43]
-    k_to_basis_vecs = get_attn_output_circle_bases(
-        o_dict=o_dict,
+    k_to_basis_vecs = get_embeddings_circle_bases(
+        embeddings=o_dict['o'],
         k_values=K_VALUES,
     )
 
@@ -1066,7 +1097,6 @@ def visualize_o_circles(
 
         basis_vecs = k_to_basis_vecs[k]
         o_values_projected = o_values @ basis_vecs
-        o_values_projected = o_values_projected
 
         # Scatter plot
         # We do milli_periods because cmaps can't give us decimal periods
@@ -1099,8 +1129,8 @@ def do_WE_and_o_coexist(
     """
     Finds the basis vectors for the o vectors as well as the W_E vectors
     """
-    k_to_o_basis_vecs = get_attn_output_circle_bases(
-        o_dict=o_dict,
+    k_to_o_basis_vecs = get_embeddings_circle_bases(
+        embeddings=o_dict['o'],
         k_values=k_values,
     )
 
@@ -1174,8 +1204,8 @@ def visualize_W_up_PCA(
     """
     Finds the basis vectors for the o vectors as well as the W_E vectors
     """
-    k_to_o_basis_vecs = get_attn_output_circle_bases(
-        o_dict=o_dict,
+    k_to_o_basis_vecs = get_embeddings_circle_bases(
+        embeddings=o_dict['o'],
         k_values=k_values,
     )
 
@@ -1225,13 +1255,18 @@ def visualize_W_up_PCA(
     plt.suptitle(f'$\\bf{{W\_up\ vectors\ in\ 2D\ Subspace\ Corresponding\ To:}}$', fontsize=11)
     plt.show()
 
-def profile_b_up(model: Transformer):
+def profile_b_up(model: Transformer, do_b_down_instead: bool = False):
     """
     What the fuck's up with this MLP? MLP is severely over provisioned.
     No superposition necessary
     """
     fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-    b = model.blocks[0].mlp.b_up.detach().cpu().numpy()
+    if do_b_down_instead:
+        b = model.blocks[0].mlp.b_down.detach().cpu().numpy()
+    else:
+        b = model.blocks[0].mlp.b_up.detach().cpu().numpy()
+    b_top_8_idxs = np.argsort(b)[::-1][:8]
+    print(f'b_top_8_idxs: {b_top_8_idxs}')
     b.sort()
 
     x_axis = np.arange(len(b))
@@ -1247,6 +1282,686 @@ def profile_b_up(model: Transformer):
     ax.set_title(f'b_up values sorted', fontsize=10)
     plt.show()
 
+def profile_W_up_singular_values(model: Transformer):
+    """
+    Well... replacing W_up with Linear layer doesn't super work either,
+    so what's going on?
+    """
+    W_up = model.blocks[0].mlp.W_up.detach().cpu().numpy() # shape (d_mlp, d_model)
+
+    singular_values = np.linalg.svd(W_up, compute_uv=False)
+
+    x_axis = np.arange(len(singular_values))
+
+    # Color based on magnitude
+    max_abs_value = max(np.abs(singular_values))
+    norm = Normalize(vmin=-max_abs_value, vmax=max_abs_value)
+    cmap = plt.cm.coolwarm
+    colors = cmap(norm(singular_values))
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.bar(x_axis, singular_values, width=1.0, color=colors)
+    ax.set_facecolor(BACKGROUND_COLOR)
+    ax.set_title('Singular values of W_up', fontsize=10)
+    ax.set_xlabel('Index')
+    ax.set_ylabel('Singular value')
+    plt.show()
+
+def profile_W_up_singular_vector_spaces(model: Transformer):
+    """
+    Identifies the top 8 singular vectors and visualizes all 2D subspaces
+    that could be spanned by pairs of them (64 total)
+    """
+    TOP_K = 8
+    W_up = model.blocks[0].mlp.W_up.detach().cpu().numpy() # shape (d_mlp, d_model)
+
+    # SVD
+    U, S, Vt = np.linalg.svd(W_up)
+
+    # Get top 8 singular vectors (right singular vectors)
+    # These are the first 8 rows of Vt, or equivalently, first 8 columns of V
+    V = Vt.T
+    top_k_vectors = V[:, :TOP_K]  # shape (128, 8)
+
+    # Project all 512 rows of W_up onto these 8 directions
+    projections = W_up @ top_k_vectors  # shape (512, 8)
+
+    # Also compute each dimension (standard basis vector e_i)'s similarity
+    # to the 8D subspace spanned by the top 8 eigen vecs. This will show
+    # the top 8 dimensions that are most spanned by the eigen vecs.
+    basis_vecs = np.identity(128)
+    subspace_angles_deg = []
+    for basis_vec in basis_vecs:
+        angles = subspace_angles(top_k_vectors, basis_vec[:,None])
+        principle_angle = angles[0]
+        angle_deg = np.degrees(principle_angle)
+        subspace_angles_deg.append(angle_deg)
+    subspace_angles_deg = np.array(subspace_angles_deg)
+    
+    # Smallest subspace angle idxs
+    smallest_subspace_angle_idxs = np.argsort(subspace_angles_deg)[:8]
+    print(f'Most similar dimensions to top 8 singular vectors: {smallest_subspace_angle_idxs}')
+    print(f'With degrees: {subspace_angles_deg[smallest_subspace_angle_idxs]}')
+
+    # Now plot all 64 pairs (8x8 grid)
+    fig, axes = plt.subplots(8, 8, figsize=(12, 12))
+    cmap = plt.get_cmap('coolwarm', 7)
+    Z = 2.5
+
+    for i in range(8):
+        for j in range(8):
+            ax = axes[i, j]
+            
+            # Get coordinates for the two directions
+            x_coords = projections[:, j]  # column j for x-axis
+            y_coords = projections[:, i]  # column i for y-axis
+            
+            # Plot the 512 points
+            ax.scatter(x_coords, y_coords, color=cmap(2), alpha=0.5, s=3)
+            ax.set_title(f'SV{j + 1} vs SV{i + 1}', fontsize=8)
+            ax.set_xlabel(f'SV{j + 1}', fontsize=6)
+            ax.set_ylabel(f'SV{i + 1}', fontsize=6)
+            ax.tick_params(labelsize=6)
+            beautify_ax(ax, -Z, Z, -Z, Z)
+
+    plt.tight_layout()
+    plt.show()
+
+def inspect_mlp_acts_periodic_nature(
+        model: Transformer,
+        show_norms: bool = True,
+    ):
+    """
+    @param show_norms:      If True, show the bar chart of fourier norms.
+                            If False, show the activations in fourier coeff space
+    """
+    # Create sample pairs
+    P = 113
+    x = 70
+    y = list(range(P))
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    # Forward pass and collect the activations
+    model.eval()
+    mlp_acts_cached = None
+    num_heads = None
+
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+        mlp_acts_cached = cache['blocks.0.mlp.hook_post']   # (b, num_tokens, d_mlp)
+
+    # Only interested in the mlp activations of the `=` token
+    mlp_acts_cached = mlp_acts_cached[:, -1, :]             # (b = P, d_mlp)
+    mlp_acts_cached = mlp_acts_cached                       # (P, d_mlp)
+    P, _ = mlp_acts_cached.shape
+
+    negative_count = (mlp_acts_cached < 0).sum().item()
+    assert negative_count == 0, f'{negative_count} negative entries found in MLP outputs?'
+
+    fourier_coeffs = get_fourier_coeffs_by_hand(mlp_acts_cached.T, P)
+    fourier_coeff_norms = fourier_coeffs.norm(dim=0)
+
+    if show_norms:
+        _, ax = plt.subplots(1, 1, figsize=(12, 4))
+        cmap = plt.get_cmap('coolwarm', 7)
+
+        x_axis = np.linspace(1, P, P - 1)
+        x_ticks = [i for i in range(0, P, 10)]
+        x_tick_labels = [i // 2 for i in range(0, P, 10)]
+
+        colors = [cmap(2) if i % 2 == 0 else cmap(5) for i in range(P)]
+        ax.bar(x_axis, fourier_coeff_norms[1:], width=0.6, color=colors)
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels(x_tick_labels)                               # shape (d_model, 2)
+        ax.set_facecolor(BACKGROUND_COLOR)
+    else:
+        fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 7))
+        K_VALUES = [4, 32, 43]
+
+        for i, k in enumerate(K_VALUES):
+            ax = axes[i]
+            basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]
+            basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+            basis_vecs /= basis_vecs_norm    # shape (d_model, 2)
+
+            projected = mlp_acts_cached @ basis_vecs
+
+            b1_mag = projected[:,0].numpy()
+            b2_mag = projected[:,1].numpy()
+
+            # We do milli_periods because cmaps can't give us decimal periods
+            milli_period = int(1000 * P / k)
+            cmap = plt.get_cmap('coolwarm', milli_period)
+            colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+
+            # Scatter plot
+            ax.scatter(b1_mag, b2_mag, c=colors, s=50, alpha=0.8)
+
+            Z = 40.0
+            beautify_ax(
+                ax,
+                xmin=-Z,
+                xmax=Z,
+                ymin=-Z,
+                ymax=Z
+            )
+            ax.set_xlabel('PC 1')
+            ax.set_ylabel('PC 2')
+            ax.set_title(
+                f'{k} Hz Circle',
+                fontsize=10
+            )
+        plt.suptitle('MLP activations in 2D subspace corresponding to:')
+
+    plt.show()
+
+def show_imperfect_circle(
+        model: Transformer,
+        k: int
+    ):
+    """
+    Show the empeddings in MLP activation space
+
+    @param show_norms:      If True, show the bar chart of fourier norms.
+                            If False, show the activations in fourier coeff space
+    """
+    # Create sample pairs
+    P = 113
+    x = 100
+    y = list(range(P))
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    # Forward pass and collect the activations
+    model.eval()
+    mlp_acts_cached = None
+
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+        mlp_acts_cached = cache['blocks.0.mlp.hook_post']   # (b, num_tokens, d_mlp)
+
+    # Only interested in the mlp activations of the `=` token
+    mlp_acts_cached = mlp_acts_cached[:, -1, :]             # (b = P, d_mlp)
+    P, _ = mlp_acts_cached.shape
+
+    fourier_coeffs = get_fourier_coeffs_by_hand(mlp_acts_cached.T, P)
+
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 8))
+
+    basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]
+    basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+    basis_vecs /= basis_vecs_norm    # shape (d_model, 2)
+
+    projected = mlp_acts_cached @ basis_vecs
+
+    # # Do additional step of centering
+    # projected -= projected.mean(dim=0, keepdim=True)
+
+    b1_mag = projected[:,0].numpy()
+    b2_mag = projected[:,1].numpy()
+
+    # We do milli_periods because cmaps can't give us decimal periods
+    milli_period = int(1000 * P / k)
+    cmap = plt.get_cmap('coolwarm', milli_period)
+    colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+
+    # Scatter plot
+    SCATTER_WIDTH = 50
+    ax.scatter(b1_mag, b2_mag, c=colors, s=SCATTER_WIDTH, alpha=0.8)
+
+    # Annotate each point with its index
+    for p in range(P):
+        ax.annotate(
+            str(p),
+            (b1_mag[p], b2_mag[p]),
+            fontsize=8,
+            alpha=0.7,
+            xytext=(3, 3),
+            textcoords='offset points'
+        )
+
+    LINEWIDTH = 1
+    COLOR = 'darkslategrey'
+    FEATURE_ALPHA = 1.0
+    scatter_kwargs = { 's': SCATTER_WIDTH, 'color': COLOR, 'alpha': FEATURE_ALPHA }
+    line_kwargs = { 'linewidth': LINEWIDTH, 'color': COLOR, 'alpha': FEATURE_ALPHA, 'zorder': 10 }
+    # Plot a vector to represent probe for feature 65
+    draw_vector(
+        ax,
+        v = projected[65] * 0.7,
+        scatter_kwargs=scatter_kwargs,
+        line_kwargs=line_kwargs
+    )
+    ax.annotate(
+        '$\\bf{{W\_L[65]\ (candidate)}}$',
+        projected[65] * 0.7,
+        fontsize=10,
+        alpha=0.7,
+        xytext=(3, 3),
+        textcoords='offset points'
+    )
+
+    # Extended dashed line along the feature's direction
+    dotted_line_x = np.linspace(0, projected[65, 0] * 10, 5)
+    dotted_line_y = np.linspace(0, projected[65, 1] * 10, 5)
+    ax.plot(dotted_line_x, dotted_line_y, '--', color='grey', linewidth=1.5, alpha=0.6, zorder=-10)
+
+    Z = 30.0
+    beautify_ax(
+        ax,
+        xmin=-Z,
+        xmax=Z,
+        ymin=-Z,
+        ymax=Z
+    )
+    ax.set_xlabel('PC 1')
+    ax.set_ylabel('PC 2')
+    # ax.set_xticks([])
+    # ax.set_yticks([])
+    ax.set_title('Up Close: 4 Hz Circle (MLP Activations)', fontsize=11)
+
+    plt.show()
+
+def show_WL_wrt_MLP_outs(
+        model: Transformer,
+        expected_ans: int = 65
+    ):
+    """
+    @param feat_i:      the expected answer
+    """
+    # Create sample pairs
+    P = 113
+    x = 70
+    y = list(range(P))
+    sample_pairs = [(x, _y, P) for _y in y]
+
+    # Make the dataloader (full batch)
+    sample_dataset = MyDataset(sample_pairs)
+    sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+    # Install the attn activation cache
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    # Forward pass and collect the activations
+    model.eval()
+    mlp_outs_cached = None
+
+    for batch_x, batch_y in sample_dataloader:
+        _ = model(batch_x)
+        mlp_outs_cached = cache['blocks.0.hook_mlp_out']    # (b, num_tokens, d_model)
+
+    # Only interested in the mlp activations of the `=` token
+    mlp_outs_cached = mlp_outs_cached[:, -1, :]                 # (b = P, d_model)
+    P, _ = mlp_outs_cached.shape
+    fourier_coeffs = get_fourier_coeffs_by_hand(mlp_outs_cached.T, P)
+
+    # Get W_U as well
+    W_U = model.unembed.W_U.detach().cpu()                  # shape (d_model, d_vocab)
+    W_U = W_U.T                                             # shape (d_vocab, d_model)
+    W_U = W_U[:-1,:]                                        # shape (P, d_model)
+    ans_feat = W_U[expected_ans]                            # shape (d_model,)
+
+    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(16, 8))
+    K_VALUES = [4, 32, 43]
+    Z = 200.0
+
+    for i, k in enumerate(K_VALUES):
+        ax = axes[i]
+        basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]]
+        basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+        basis_vecs /= basis_vecs_norm                       # shape (d_model, 2)
+
+        mlp_acts_projected = mlp_outs_cached @ basis_vecs
+        ans_feat_projected = ans_feat @ basis_vecs                  # shape (2,)
+        ans_feat_projected /= ans_feat_projected.norm(keepdim=True)
+        ans_feat_projected *= 0.5 * Z
+
+        mlp_b1 = mlp_acts_projected[:,0].numpy()
+        mlp_b2 = mlp_acts_projected[:,1].numpy()
+
+        # We do milli_periods because cmaps can't give us decimal periods
+        milli_period = int(1000 * P / k)
+        cmap = plt.get_cmap('coolwarm', milli_period)
+        colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+
+        # Scatter plot
+        SCATTER_WIDTH = 50
+        ax.scatter(mlp_b1, mlp_b2, c=colors, s=SCATTER_WIDTH, alpha=0.6)
+
+        # Annotate each point with its index
+        for p in range(P):
+            ax.annotate(
+                str(p),
+                (mlp_b1[p], mlp_b2[p]),
+                fontsize=15 if p ==108 else 8,
+                color='white' if p == 108 else 'black',
+                alpha=0.7,
+                xytext=(3, 3),
+                textcoords='offset points',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8) if p == 108 else None
+            )
+
+        LINEWIDTH = 1
+        COLOR = 'darkslategrey'
+        FEATURE_ALPHA = 1.0
+        scatter_kwargs = { 's': SCATTER_WIDTH, 'color': COLOR, 'alpha': FEATURE_ALPHA }
+        line_kwargs = {
+            'linewidth': LINEWIDTH,
+            'color': COLOR,
+            'alpha': FEATURE_ALPHA,
+            'zorder': 10 
+        }
+        # Plot a vector to represent probe for feature 65
+        draw_vector(
+            ax,
+            v = ans_feat_projected * 0.7,
+            scatter_kwargs=scatter_kwargs,
+            line_kwargs=line_kwargs
+        )
+        ax.annotate(
+            f'$\\bf{{W\_L[{expected_ans}]}}$',
+            ans_feat_projected * 0.7,
+            fontsize=10,
+            alpha=0.7,
+            xytext=(3, 3),
+            textcoords='offset points'
+        )
+
+        # Extended dashed line along the feature's direction
+        dotted_line_x = np.linspace(0, ans_feat_projected[0] * 10, 5)
+        dotted_line_y = np.linspace(0, ans_feat_projected[1] * 10, 5)
+        ax.plot(dotted_line_x, dotted_line_y, '--', color='grey', linewidth=1.5, alpha=0.6, zorder=-10)
+
+        beautify_ax(
+            ax,
+            xmin=-Z,
+            xmax=Z,
+            ymin=-Z,
+            ymax=Z
+        )
+        ax.set_xlabel('PC 1')
+        ax.set_ylabel('PC 2')
+        ax.set_title('Up Close: 4 Hz Circle (MLP outputs)', fontsize=11)
+
+    plt.show()
+
+def o_circles_clockwork(
+        model: Transformer,
+        a_values: list[int],
+        k: int,
+        expected_ans: int | None,
+        do_headwise_computation: bool = False,
+        hook_point: str = 'blocks.0.attn.hook_o',
+        use_basis_cached: bool = True,
+):
+    """
+    @param k:       frequency of circle space interested
+    """
+    # Create sample pairs
+    P = 113
+    b_values = list(range(P))
+
+    fig, axes = plt.subplots(
+        nrows=(3 + len(a_values)) // 4,
+        ncols=min(len(a_values), 4),
+        figsize=(12, 12)
+    )
+    axes = axes.flatten()
+    SCATTER_SIZE = 20
+    SCATTER_ALPHA = 0.7
+
+    # Get W_U to plot ans vectors
+    W_U = model.unembed.W_U.detach().cpu()                  # shape (d_model, d_vocab)
+    W_U = W_U.T                                             # shape (d_vocab, d_model)
+    W_U = W_U[:-1,:]                                        # shape (P, d_model)
+    ans_feat = W_U[expected_ans]                            # shape (d_model,)
+
+    basis_cached = None
+    bases = []
+    for a_i, a in enumerate(a_values):
+        if isinstance(expected_ans, int):
+            b = (expected_ans - a) % P
+        ax = axes[a_i]
+        sample_pairs = [(a, b, P) for b in b_values]
+
+        # Make the dataloader (full batch)
+        sample_dataset = MyDataset(sample_pairs)
+        sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+        # Install the attn activation cache
+        cache = {}
+        model.remove_all_hooks()
+        model.cache_all(cache)
+
+        # Forward pass and collect the activations
+        model.eval()
+        z_values_by_head = {}
+        embeddings_cached = None
+        o_values_by_head = {}
+        num_heads = None
+
+        for batch_x, _ in sample_dataloader:
+            _ = model(batch_x)
+
+            z_values = cache['blocks.0.attn.hook_z']                # (b, num_heads, num_tokens, d_head)
+            embeddings_cached = cache[hook_point]         # (b, num_tokens, d_model)
+
+            _, num_heads, _, _ = z_values.shape
+            for i in range(num_heads):
+                z_values_by_head[f'head_{i}'] = z_values[:,i,:,:]
+
+        if do_headwise_computation:
+            # I still need the fourier coeff basis from W_E for k
+            W_E = model.embed.W_E.detach().cpu()                        # shape (d_model, d_vocab)
+            W_E = W_E[:,:-1]                                            # shape (d_model, P)
+            fourier_coeffs = get_fourier_coeffs_by_hand(W_E, P)
+
+            # Because we want to extract those 2 dimensions of the embeddings, then
+            # apply W_V to it
+            basis_vecs = fourier_coeffs[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]] # shape (d_model, 2)
+            basis_vecs_norm = basis_vecs.norm(p=2, dim=0, keepdim=True)
+            basis_vecs /= basis_vecs_norm                            
+
+            # I need W_V and W_O because I need to transform embeddings from W_E to W_V to W_O space
+            W_V = model.blocks[0].attn.W_V.detach().cpu()       # shape (num_heads, d_head, d_model)
+            W_O = model.blocks[0].attn.W_O.detach().cpu()       # shape (d_model, num_heads * d_head)
+
+            # Calculate the basis transformation that would allow us to visualize in 2D
+            o_projected_by_head = {}
+            for head_i in range(num_heads):
+                W_V_this_head = W_V[head_i,:,:]                         # shape (d_head, d_model)
+                W_V_this_head = W_V_this_head.T                         # shape (d_model, d_head)
+                W_V_pinv = compute_pinv_by_hand(W_V_this_head)          # shape (d_head, d_model)
+
+                num_heads, d_head, d_model = W_V.shape
+                W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head]  # shape (d_model, d_head)
+                W_O_this_head = W_O_this_head.T                                 # shape (d_head, d_model)
+                W_O_pinv = compute_pinv_by_hand(W_O_this_head)                  # shape (d_model, d_head)
+
+                WV_WO_pinv = W_O_pinv @ W_V_pinv                                # shape (d_model, d_model)
+                new_basis = WV_WO_pinv @ basis_vecs                             # shape (d_model, 2)
+
+                z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
+                o_values_this_head = z_values_this_head @ W_O_this_head         # shape (b, num_tokens, d_model)
+                # Only want to focus on the `=` token
+                o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
+
+                # Project onto the 2 directions we computed from W_E
+                o_values_projected = (o_values_this_head @ new_basis).numpy()
+                o_projected_by_head[head_i] = o_values_projected
+
+            # Overall
+            # This should work
+            o_values_projected = np.vstack([projected[None,:,:] for projected in o_projected_by_head.values()])
+            o_values_projected = np.sum(o_values_projected, axis=0)
+            embeddings_projected = o_values_projected
+
+            Z = 2.0
+        else:
+            embeddings = embeddings_cached[:,-1,:]
+            if use_basis_cached and isinstance(basis_cached, (np.ndarray, torch.Tensor)):
+                print('using cached basis')
+                basis_vecs = basis_cached
+            else:
+                k_to_basis_vecs = get_embeddings_circle_bases(
+                    embeddings,
+                    k_values=[k]
+                )
+                basis_vecs = k_to_basis_vecs[k]
+                basis_cached = basis_vecs
+                bases.append(basis_vecs)
+
+            embeddings_projected = embeddings @ basis_vecs
+
+            if hook_point == 'blocks.0.attn.hook_o':
+                Z = 10.
+            elif hook_point == 'blocks.0.hook_mlp_out':
+                Z = 150.
+            else:
+                Z = 30.
+
+        b1_mag = embeddings_projected[:,0]
+        b2_mag = embeddings_projected[:,1]
+
+        # We do milli_periods because cmaps can't give us decimal periods
+        milli_period = int(1000 * P / k)
+        cmap = plt.get_cmap('coolwarm', milli_period)
+        colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+
+        # Do scatter
+        ax.scatter(b1_mag, b2_mag, color=colors, s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
+        # BIG scatter
+        for anchor_p in [3, 33, 63]:
+            ax.scatter(b1_mag[anchor_p], b2_mag[anchor_p], color='black', s=SCATTER_SIZE * 2, alpha=1.0)
+            ax.annotate(
+                str(anchor_p),
+                (b1_mag[anchor_p], b2_mag[anchor_p]),
+                fontsize=8,
+                alpha=0.7,
+                xytext=(3, 3),
+                textcoords='offset points'
+            )
+        ax.set_title(f'(a = {a}) + b = {expected_ans or ""}', fontsize=9)
+
+        # Want to also just plot where on earth the embeddings are
+        if '.mlp.' not in hook_point:
+            W_E = model.embed.W_E.detach().cpu()                        # shape (d_model, d_vocab)
+            W_E = W_E[:,:-1]                                            # shape (d_model, P)
+            W_E = W_E.T                                                 # shape (P, d_model)
+            W_E = W_E[:,None,:]                                         # shape (P, 1, d_model)
+
+            # Transform these into O space
+            W_V = model.blocks[0].attn.W_V.detach().cpu()               # shape (num_heads, d_head, d_model)
+            W_O = model.blocks[0].attn.W_O.detach().cpu()               # shape (d_model, num_heads * d_head)
+            number_feats = torch.einsum(
+                'ihd,bpd -> biph',
+                W_V,
+                W_E
+            )
+            number_feats = einops.rearrange(number_feats, 'b i p h -> b p (i h)')
+            number_feats = torch.einsum('df,bqf->bqd', W_O, number_feats)   # shape (P, 1, d_model)
+            number_feats = number_feats[:,0,:]                              # shape (P, d_model)
+            number_feats = (number_feats @ basis_vecs).numpy()
+
+            ax.scatter(
+                number_feats[:,0],
+                number_feats[:,1],
+                color='grey', s=SCATTER_ALPHA, alpha=SCATTER_ALPHA
+            )
+
+        # Plot W_U line for expected answer
+        if isinstance(expected_ans, int):
+            LINEWIDTH = 1
+            COLOR = 'darkslategrey'
+            FEATURE_ALPHA = 1.0
+            scatter_kwargs = { 's': SCATTER_SIZE, 'color': COLOR, 'alpha': FEATURE_ALPHA }
+            line_kwargs = {
+                'linewidth': LINEWIDTH,
+                'color': COLOR,
+                'alpha': FEATURE_ALPHA,
+                'zorder': 10 
+            }
+            # Plot a vector to represent linear direction of answer
+            ans_feat_projected = ans_feat @ basis_vecs                  # shape (2,)
+            ans_feat_projected /= ans_feat_projected.norm(keepdim=True)
+            ans_feat_projected *= 0.5 * Z
+
+            draw_vector(
+                ax,
+                v = ans_feat_projected * 0.7,
+                scatter_kwargs=scatter_kwargs,
+                line_kwargs=line_kwargs
+            )
+            ax.annotate(
+                f'$\\bf{{W\_L[{expected_ans}]}}$',
+                ans_feat_projected * 0.7,
+                fontsize=10,
+                alpha=0.7,
+                xytext=(3, 3),
+                textcoords='offset points'
+            )
+
+            # Extended dashed line along the feature's direction
+            dotted_line_x = np.linspace(0, ans_feat_projected[0] * 10, 5)
+            dotted_line_y = np.linspace(0, ans_feat_projected[1] * 10, 5)
+            ax.plot(dotted_line_x, dotted_line_y, '--', color='grey', linewidth=1.5, alpha=0.6, zorder=-10)
+
+    for ax in axes:
+        beautify_ax(ax, -Z, Z, -Z, Z)
+        # ax.set_xticks([])
+        # ax.set_yticks([])
+
+    # plt.suptitle(
+    #     f'$\\bf{{o\ vectors}}$\nin 2D subspace corresponding to freq {k} Hz embedding circle',
+    #     fontsize=11
+    # )
+    plt.show()
+
+    # subspace angles
+    plt.close()
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    subspace_angle_matrix = np.zeros((len(bases), len(bases)))
+    for i, basis_i in enumerate(bases):
+        for j, basis_j in enumerate(bases):
+            principle_angle = subspace_angles(basis_i, basis_j)[0]
+            principle_angle_deg = np.degrees(principle_angle)
+            subspace_angle_matrix[i, j] = principle_angle_deg
+            
+    ax.imshow(subspace_angle_matrix, cmap='coolwarm', vmin=-90., vmax=90.)
+    # Add text annotations to each cell
+    for i in range(len(bases)):
+        for j in range(len(bases)):
+            angle = subspace_angle_matrix[i, j]
+            text = ax.text(
+                j, i,
+                f'{angle:.0f}°',
+                ha="center",
+                va="center",
+                color="black" if abs(angle) < 45 else "white",
+                fontsize=7
+            )
+    
+    plt.show()
+
 
 if __name__ == '__main__':
     CHECKPOINT_FILE = 'checkpoints/grokked_20k/epoch_19999.pt'
@@ -1257,7 +1972,7 @@ if __name__ == '__main__':
     train_pairs, test_pairs = load_data(DATA_FILE)
     # inspect_periodic_nature(model, weight_matrix='W_L', do_DFT_by_hand=True)
     # inspect_PCA_W_E(model, weight_matrix='W_L', k_vals=[4, 32, 43])
-    # inspect_attention_maps(model, test_pairs, num_samples=6, show_only_last_attn_row=True)
+    # inspect_attention_maps(model, test_pairs, num_samples=6, show_only_last_attn_row=True, full_p_by_p_plot=True)
     # inspect_attention_maps_periodic_nature(model)
 
     # inspect_attention_z_values(
@@ -1284,7 +1999,7 @@ if __name__ == '__main__':
     #     o_projected_save_loc=O_PROJECTED_SAVE_LOC.format(k=K)
     # )
 
-    o_dict = np.load(O_PROJECTED_SAVE_LOC.format(k=K))
+    # o_dict = np.load(O_PROJECTED_SAVE_LOC.format(k=K))
     # inspect_attention_outputs_periodic_nature(
     #     model,
     #     o_dict,
@@ -1295,8 +2010,30 @@ if __name__ == '__main__':
     #     o_dict
     # )
 
+    # SECTION 8
     # do_WE_and_o_coexist(model, o_dict)
 
     # visualize_W_up_PCA(model, o_dict)
 
-    profile_b_up(model)
+    # profile_b_up(model, do_b_down_instead=True)
+
+    # profile_W_up_singular_values(model)
+
+    # profile_W_up_singular_vector_spaces(model)
+
+    # inspect_mlp_acts_periodic_nature(model, show_norms=False)
+
+    # show_imperfect_circle(model, k = 4)
+
+    # show_WL_wrt_MLP_outs(model, expected_ans=65)
+
+    # WIP (discovery made)
+    o_circles_clockwork(
+        model,
+        a_values = [i for i in range(30, 60)],
+        expected_ans=None,
+        k = 4,
+        # hook_point='blocks.0.hook_mlp_out'
+        hook_point='blocks.0.mlp.hook_post',
+        use_basis_cached=False,
+    )

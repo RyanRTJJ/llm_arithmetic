@@ -1,10 +1,80 @@
+from typing import Any
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle
+from matplotlib.patches import FancyArrowPatch
+from mpl_toolkits.mplot3d import proj3d
 from matplotlib import collections as mc
 
 BACKGROUND_COLOR = '#FCFBF8'
+
+class Arrow3D(FancyArrowPatch):
+    """
+    A helper class to draw 3D arrows
+    """
+    def __init__(self, xs, ys, zs, *args, **kwargs):
+        """
+        @param xs:      (List) of length 2, from [src, dst]
+        """
+        FancyArrowPatch.__init__(self, (0,0), (0,0), *args, **kwargs)
+        self._verts3d = xs, ys, zs
+
+    def draw(self, renderer):
+        xs3d, ys3d, zs3d = self._verts3d
+        xs, ys, _ = proj3d.proj_transform(xs3d, ys3d, zs3d, self.axes.M)
+        self.set_positions((xs[0],ys[0]),(xs[1],ys[1]))
+        FancyArrowPatch.draw(self, renderer)
+
+    def do_3d_projection(self, renderer=None):
+        xs3d, ys3d, zs3d = self._verts3d
+        xs, ys, zs = proj3d.proj_transform(xs3d, ys3d, zs3d, self.axes.M)
+        self.set_positions((xs[0],ys[0]),(xs[1],ys[1]))
+
+        return np.min(zs)
+
+def beautify_ax_3d(ax, Z):
+    """
+    @param Z:               limits of plot
+    """
+    ax.set_box_aspect((1, 1, 1))
+    ax.set_xlim(-Z, Z)
+    ax.set_ylim(-Z, Z)
+    ax.set_zlim(-Z, Z)
+    ax.set_facecolor(BACKGROUND_COLOR)
+    # Blow up the grid
+    ax.grid(False)
+    ax.set_axis_off()
+
+def draw_arrow_3d(ax, src, dst, arrow_kwargs):
+    arrow = Arrow3D(
+        [src[0], dst[0]],
+        [src[1], dst[1]],
+        [src[2], dst[2]],
+        **arrow_kwargs
+    )
+    ax.add_artist(arrow)
+
+def add_axis_lines_3d(ax, Z, arrow_kwargs: dict[str, Any]=None, partial=False, **kwargs):
+    """
+    @param Z:               arrow spans from -Z to Z
+    @param arrow_kwargs:    Optional non-default arrow_kwargs
+    """
+    # Add new axis lines
+    if not arrow_kwargs:
+        arrow_kwargs = {'arrowstyle': '-|>', 'mutation_scale': 10, 'lw': 1, 'color': 'black'}
+
+    lb = 0 if partial else -Z
+    if not 'omit_x' in kwargs:
+        x_axis = Arrow3D([lb, Z], [0, 0], [0, 0], **arrow_kwargs)
+        ax.add_artist(x_axis)
+    if not 'omit_y' in kwargs:
+        y_axis = Arrow3D([0, 0], [lb, Z], [0, 0], **arrow_kwargs)
+        ax.add_artist(y_axis)
+    if not 'omit_z' in kwargs:
+        z_axis = Arrow3D([0, 0], [0, 0], [lb, Z], **arrow_kwargs)
+        ax.add_artist(z_axis)
 
 def beautify_ax(ax: plt.Axes, xmin: float, xmax: float, ymin: float, ymax: float, ignore_aspect_ratio=False):
     ax.set_facecolor(BACKGROUND_COLOR)
@@ -391,6 +461,267 @@ def do_family_of_curves(
 
     plt.show()
 
+def show_shifting_circle():
+    fig = plt.figure(figsize=(14, 6))
+    cmap = plt.get_cmap('coolwarm', 7)
+    edge_cmap = plt.get_cmap('coolwarm')
+
+    N_POINTS = 100
+    RADIUS = 1.0
+    Z = 3.0
+    FILL_COLOR = cmap(3)
+    FILL_ALPHA = 0.9
+    SHADE = False
+    OFFSET_DIST = 1.8
+    OFFSET_ARROW_KWARGS = {
+        'arrowstyle': '-|>',
+        'mutation_scale': 10,
+        'lw': 1.5,
+        'color': 'black',
+        'alpha': 1
+    }
+
+    theta = np.linspace(0, 2 * np.pi, N_POINTS)
+
+    ax1 = fig.add_subplot(131, projection='3d')
+
+    x1 = RADIUS * np.cos(theta)
+    y1 = RADIUS * np.sin(theta)
+    z1 = np.zeros_like(theta)
+
+    # Plot the filled circle
+    ax1.plot_trisurf(x1, y1, z1, color=FILL_COLOR, alpha=FILL_ALPHA, shade=SHADE)
+    # Plot the border with gradient colors
+    for i in range(len(theta) - 1):
+        color = edge_cmap(i / (len(theta) - 1))
+        ax1.plot(
+            [x1[i], x1[i + 1]],
+            [y1[i], y1[i + 1]],
+            [z1[i], z1[i + 1]],
+            color=color,
+            linewidth=3
+        )
+
+    ax1.set_title('Pre-shift', fontsize=11)
+
+    ax2 = fig.add_subplot(132, projection='3d')
+
+    # Plot the up-shifted circle
+    upshifted_z = np.ones_like(theta) * OFFSET_DIST
+    ax2.plot_trisurf(
+        x1,
+        y1,
+        upshifted_z,
+        color=FILL_COLOR,
+        alpha=FILL_ALPHA,
+        shade=SHADE
+    )
+    # Plot the border with gradient colors
+    for i in range(len(theta) - 1):
+        color = edge_cmap(i / (len(theta) - 1))
+        ax2.plot(
+            [x1[i], x1[i + 1]],
+            [y1[i], y1[i + 1]],
+            [upshifted_z[i], upshifted_z[i + 1]],
+            color=color,
+            linewidth=3
+        )
+
+    # Plot the normal vector for reference
+    offset = np.array([0., 0., OFFSET_DIST])
+    draw_arrow_3d(
+        ax2,
+        np.zeros((3,)),
+        offset,
+        OFFSET_ARROW_KWARGS
+    )
+    ax2.text(
+        OFFSET_DIST / 3, 0.1, 0.8,
+        'offset',
+        fontsize=10,
+        ha='left',
+        color='black'
+    )
+    ax2.set_title('Shift by Offset', fontsize=11)
+
+    # Plot 3
+    ax3 = fig.add_subplot(133, projection='3d')
+
+    # Center of the circle
+    offset_coord = np.sqrt(OFFSET_DIST ** 2 / 3.)
+    offset = np.array([offset_coord, offset_coord, offset_coord])
+
+    # Normal vector (perpendicular direction)
+    normal = offset
+    normal = normal / np.linalg.norm(normal)  # normalize
+
+    # Create two orthogonal vectors in the plane perpendicular to normal
+    # First, find any vector perpendicular to normal
+    if abs(normal[0]) < 0.9:
+        v1 = np.cross(normal, [1, 0, 0])
+    else:
+        v1 = np.cross(normal, [0, 1, 0])
+    v1 = v1 / np.linalg.norm(v1)
+
+    # Second perpendicular vector
+    v2 = np.cross(normal, v1)
+    v2 = v2 / np.linalg.norm(v2)
+
+
+    # Parametrize circle in the perpendicular plane
+    x3 = offset[0] + RADIUS * (v1[0] * np.cos(theta) + v2[0] * np.sin(theta))
+    y3 = offset[1] + RADIUS * (v1[1] * np.cos(theta) + v2[1] * np.sin(theta))
+    z3 = offset[2] + RADIUS * (v1[2] * np.cos(theta) + v2[2] * np.sin(theta))
+
+    # Plot the filled circle
+    ax3.plot_trisurf(x3, y3, z3, color=FILL_COLOR, alpha=FILL_ALPHA, shade=SHADE)
+
+    # Plot the border with gradient colors
+    for i in range(len(theta) - 1):
+        color = edge_cmap(i / (len(theta)-1))
+        ax3.plot(
+            [x3[i], x3[i + 1]],
+            [y3[i], y3[i + 1]],
+            [z3[i], z3[i + 1]],
+            color=color,
+            linewidth=3
+        )
+
+    draw_arrow_3d(
+        ax3,
+        np.zeros((3,)),
+        offset,
+        OFFSET_ARROW_KWARGS
+    )
+    ax3.text(
+        0.7, 0., 0.5,
+        'offset (rotated)',
+        fontsize=10,
+        ha='left',
+        color='black'
+    )
+
+    ax3.set_title('Rotate: Now In Positive Orthant', fontsize=11)
+
+    for ax in [ax1, ax2, ax3]:
+        beautify_ax_3d(ax, Z=2)
+        add_axis_lines_3d(ax, Z=Z)
+        ax.view_init(elev=8, azim=-115, roll=0)
+
+    plt.show()
+
+def show_shifting_circle_CORRECT():
+    fig = plt.figure(figsize=(14, 6))
+    cmap = plt.get_cmap('coolwarm', 7)
+    edge_cmap = plt.get_cmap('coolwarm')
+
+    N_POINTS = 100
+    RADIUS = 1.0
+    Z = 3.0
+    FILL_COLOR = cmap(3)
+    FILL_ALPHA = 0.9
+    SHADE = False
+    OFFSET_DIST = 1.8
+    OFFSET_ARROW_KWARGS = {
+        'arrowstyle': '-|>',
+        'mutation_scale': 10,
+        'lw': 1.5,
+        'color': 'black',
+        'alpha': 1
+    }
+
+    theta = np.linspace(0, 2 * np.pi, N_POINTS)
+
+    ax1 = fig.add_subplot(121, projection='3d')
+
+    x1 = RADIUS * np.cos(theta)
+    y1 = RADIUS * np.sin(theta)
+    z1 = np.zeros_like(theta)
+
+    # Plot the filled circle
+    ax1.plot_trisurf(x1, y1, z1, color=FILL_COLOR, alpha=FILL_ALPHA, shade=SHADE)
+    # Plot the border with gradient colors
+    for i in range(len(theta) - 1):
+        color = edge_cmap(i / (len(theta) - 1))
+        ax1.plot(
+            [x1[i], x1[i + 1]],
+            [y1[i], y1[i + 1]],
+            [z1[i], z1[i + 1]],
+            color=color,
+            linewidth=3
+        )
+
+    ax1.set_title('Pre-shift', fontsize=11)
+
+    ax2 = fig.add_subplot(122, projection='3d')
+
+    # Plot the up-shifted circle
+    # Center of the circle
+    offset_coord = np.sqrt(OFFSET_DIST ** 2 / 3.)
+    offset = np.array([offset_coord, offset_coord, offset_coord])
+    x2 = x1 + np.ones_like(x1) * offset_coord
+    y2 = y1 + np.ones_like(y1) * offset_coord
+    z2 = z1 + np.ones_like(z1) * offset_coord
+
+    ax2.plot_trisurf(
+        x2,
+        y2,
+        z2,
+        color=FILL_COLOR,
+        alpha=FILL_ALPHA,
+        shade=SHADE
+    )
+    # Plot the border with gradient colors
+    for i in range(len(theta) - 1):
+        color = edge_cmap(i / (len(theta) - 1))
+        ax2.plot(
+            [x2[i], x2[i + 1]],
+            [y2[i], y2[i + 1]],
+            [z2[i], z2[i + 1]],
+            color=color,
+            linewidth=3
+        )
+
+    # Plot the normal vector for reference
+    draw_arrow_3d(
+        ax2,
+        np.zeros((3,)),
+        offset,
+        OFFSET_ARROW_KWARGS
+    )
+    ax2.text(
+        0.7, 0., 0.5,
+        'offset',
+        fontsize=10,
+        ha='left',
+        color='black'
+    )
+    ax2.set_title('Shifted; Now In Positive Orthant', fontsize=11)
+
+    for ax in [ax1, ax2]:
+        beautify_ax_3d(ax, Z=2)
+        add_axis_lines_3d(ax, Z=Z)
+        ax.view_init(elev=20, azim=-115, roll=0)
+
+    plt.show()
+
+def show_sine_waves():
+    NUM_SAMPLES = 501
+    K_VALUES = [4, 32, 43]
+
+    x = np.linspace(0, 2 * np.pi, NUM_SAMPLES)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    cmap = plt.get_cmap('coolwarm', 7)
+
+    y_sum = np.zeros_like(x)
+    for i, k in enumerate(K_VALUES):
+        y = np.sin(k * x)
+        y_sum += y
+        ax.plot(x, y, color=cmap(1 + i * 2))
+    ax.plot(x, y_sum, '--', color='darkslategrey')
+    ax.set_facecolor(BACKGROUND_COLOR)
+    plt.show()
+
 if __name__ == '__main__':
     # do_curve_thingy_animation()
 
@@ -402,12 +733,17 @@ if __name__ == '__main__':
 
     ALPHA_FREQS = [0.25, 1./3, 1.0, 1.50,]
     NUM_PERIODSS = [2., 3., 2., 3.,]
-    do_family_of_curves(
-        circle_freq = 0.5,
-        alpha_freqs = ALPHA_FREQS,
-        num_periodss = NUM_PERIODSS,
-        do_animation = True,
-        alpha_period_offsets = [0.0, 0.0, 0.0, 0.0],
-        plot_scatter = False,
-        num_trajectory_samples = 1000
-    )
+    # do_family_of_curves(
+    #     circle_freq = 0.5,
+    #     alpha_freqs = ALPHA_FREQS,
+    #     num_periodss = NUM_PERIODSS,
+    #     do_animation = True,
+    #     alpha_period_offsets = [0.0, 0.0, 0.0, 0.0],
+    #     plot_scatter = False,
+    #     num_trajectory_samples = 1000
+    # )
+
+    # show_shifting_circle()
+    # show_shifting_circle_CORRECT()
+
+    show_sine_waves()

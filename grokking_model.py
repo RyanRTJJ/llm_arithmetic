@@ -163,8 +163,11 @@ class MLP(nn.Module):
             d_model: int = D_MODEL,
             d_mlp: int = D_MLP,
             act_type: str = ACT_TYPE,
+            replace_mlp_with_reluless: bool = False,
     ):
         super().__init__()
+
+        self.replace_mlp_with_reluless = replace_mlp_with_reluless
 
         self.W_up = nn.Parameter(torch.randn(d_mlp, d_model) / np.sqrt(d_model))
         self.b_up = nn.Parameter(torch.zeros(d_mlp))
@@ -175,16 +178,20 @@ class MLP(nn.Module):
         assert act_type in ['ReLU', 'GeLU'], 'Expect act_type to be one of ReLU / GeLU'
         self.act_type = act_type
 
+        self.hook_post = HookPoint()
+
     def forward(self, x: torch.Tensor):
         x = torch.einsum('md,bpd->bpm', self.W_up, x) + self.b_up
 
-        if self.act_type == 'ReLU':
-            x = F.relu(x)
-        elif self.act_type == 'GeLU':
-            x = F.gelu(x)
-        else:
-            raise ValueError('self.act_type not ReLU / GeLU')
+        if not self.replace_mlp_with_reluless:
+            if self.act_type == 'ReLU':
+                x = F.relu(x)
+            elif self.act_type == 'GeLU':
+                x = F.gelu(x)
+            else:
+                raise ValueError('self.act_type not ReLU / GeLU')
 
+        x = self.hook_post(x)
         x = torch.einsum('dm,bpm->bpd', self.W_down, x) + self.b_down
         return x
 
@@ -200,14 +207,16 @@ class TransformerBlock(nn.Module):
             num_heads: int = NUM_HEADS,
             n_ctx: int = N_CTX,
             act_type: str = ACT_TYPE,
+            replace_mlp_with_reluless: bool = False,
     ):
         super().__init__()
         self.attn = Attention(d_model, num_heads, d_head, n_ctx)
-        self.mlp = MLP(d_model, d_mlp, act_type)
+        self.mlp = MLP(d_model, d_mlp, act_type, replace_mlp_with_reluless)
+        self.hook_mlp_out = HookPoint()
 
     def forward(self, x):
-        x = x + self.attn(x)    # resid_mid
-        x = x + self.mlp(x)     # resid_post
+        x = x + self.attn(x)                        # resid_mid
+        x = x + self.hook_mlp_out(self.mlp(x))      # resid_post
         return x
 
 class Transformer(nn.Module):
@@ -232,6 +241,7 @@ class Transformer(nn.Module):
             num_heads: int = NUM_HEADS,
             n_ctx: int = N_CTX,
             act_type: str = ACT_TYPE,
+            replace_mlp_with_reluless: bool = False,
     ):
         """
         Missing params:
@@ -248,7 +258,8 @@ class Transformer(nn.Module):
                 d_head,
                 num_heads,
                 n_ctx,
-                act_type
+                act_type,
+                replace_mlp_with_reluless,
             ) for _ in range(num_layers)
         ])
         self.unembed = Unembed(d_vocab, d_model)
@@ -526,7 +537,7 @@ def train(
 
 
 if __name__ == '__main__':
-    RUN_NAME = 'debug'
+    RUN_NAME = 'debug_reluless'
 
     CHECKPOINTS_DIR = Path(f'checkpoints/{RUN_NAME}')
     DATA_DIR = Path(f'datasets/{RUN_NAME}')
@@ -537,7 +548,7 @@ if __name__ == '__main__':
     generate_data(0.3, P=PRIME, save_filename=data_file)
 
 
-    model = Transformer()
+    model = Transformer(replace_mlp_with_reluless=True)
     train(
         model,
         data_file,
