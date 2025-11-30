@@ -746,4 +746,4 @@ if __name__ == '__main__':
     # show_shifting_circle()
     # show_shifting_circle_CORRECT()
 
-    show_sine_waves()
+    # show_sine_waves()

@@ -179,9 +179,10 @@ class MLP(nn.Module):
         self.act_type = act_type
 
         self.hook_post = HookPoint()
+        self.hook_pre = HookPoint()
 
     def forward(self, x: torch.Tensor):
-        x = torch.einsum('md,bpd->bpm', self.W_up, x) + self.b_up
+        x = self.hook_pre(torch.einsum('md,bpd->bpm', self.W_up, x) + self.b_up)
 
         if not self.replace_mlp_with_reluless:
             if self.act_type == 'ReLU':
