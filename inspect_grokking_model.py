@@ -719,7 +719,8 @@ def get_interpolation(
         points: np.ndarray,
         num_points: int = 1000,
         degree: int = 3,
-        return_line_collection: bool = False
+        return_line_collection: bool = False,
+        k: int | None = None,
     ):
     """
     Helper function
@@ -743,20 +744,24 @@ def get_interpolation(
     t_smooth = np.linspace(t.min(), t.max(), num_points)
     b1_smooth = spl_b1(t_smooth)
     b2_smooth = spl_b2(t_smooth)
+    result = np.hstack([b1_smooth[:,None], b2_smooth[:,None]])
 
     if return_line_collection:
         # make a color gradient line
-        vertices = points.T.reshape(-1, 1, 2)
+        vertices = result.reshape(-1, 1, 2)
         segments = np.concatenate([vertices[:-1], vertices[1:]], axis=1)
+        
         # Create color array based on position along the curve
-        cmap = plt.get_cmap('coolwarm', num_points)
-        colors = cmap(np.linspace(0, 1, len(segments)))
+        assert n == 113, f'Unexpected n: {n}'
+        milli_period = int(1000 * n / k)
+        cmap = plt.get_cmap('coolwarm', milli_period)
+        color_indices = np.array([int(t_val * 1000) % milli_period for t_val in t_smooth])
+        colors = [cmap(idx) for idx in color_indices]
 
         # Create LineCollection
         lc = mc.LineCollection(segments, colors=colors, linewidth=1.0, alpha=0.6)
         return lc
     else:
-        result = np.hstack([b1_smooth[:,None], b2_smooth[:,None]])
         return result
 
 
@@ -905,6 +910,177 @@ def inspect_attention_outputs(
 
     plt.show()
 
+def get_z_vectors_by_head(model: Transformer, dataloader: DataLoader):
+    """
+    Helper function to get attn.hook_o activations
+    """
+    cache = {}
+    model.remove_all_hooks()
+    model.cache_all(cache)
+
+    model.eval()
+    z_values_by_head = {}
+
+    for batch_x, _ in dataloader:
+        _ = model(batch_x)
+
+        z_values = cache['blocks.0.attn.hook_z']        # (b, num_heads, pos, d_head)
+        _, num_heads, _, _ = z_values.shape
+
+        for i in range(num_heads):
+            # (b, num_tokens, d_head)
+            z_values_by_head[f'head_{i}'] = z_values[:, i, :, :]
+    
+    return z_values_by_head
+
+def animate_attention_outputs_in_agg(
+        model: Transformer,
+        k: int,
+        a_values: list[int],
+        gradient_interpolation: bool = False,
+):
+    """
+    Animates the summation of petals into a ring.
+    Basically the multi-`a` version of inspect_attention_outputs_in_agg
+    """
+    P = 113
+    b_values = list(range(P))
+
+    # Get W_E and calculate the circle basis
+    W_E = model.embed.W_E.detach().cpu()
+    W_E = W_E[:,:-1]
+    k_to_circle_basis = get_WE_circle_bases(W_E)
+    basis_vecs = k_to_circle_basis[k]           # Shape (d_model, 2)
+
+    W_V = model.blocks[0].attn.W_V.detach().cpu()
+    W_O = model.blocks[0].attn.W_O.detach().cpu()
+    num_heads = W_V.shape[0]
+
+    # Pre-compute per-head WV_WO_pinvs @ basis_vecs
+    head_to_new_basis = {}
+    for head_i in range(num_heads):
+        W_V_this_head = W_V[head_i, :, :].T                     # shape (d_model, d_head)
+        W_V_pinv = compute_pinv_by_hand(W_V_this_head)          # shape (d_head, d_model)
+
+        d_head = W_V.shape[1]
+        W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head].T    # shape (d_model, d_head)
+        W_O_pinv = compute_pinv_by_hand(W_O_this_head)                      # shape (d_model, d_head)
+
+        WV_WO_pinv = W_O_pinv @ W_V_pinv                                    # shape (d_model, d_model)
+        new_basis = WV_WO_pinv @ basis_vecs                                 # shape (d_model, 2)
+
+        head_to_new_basis[head_i] = new_basis
+
+    # Actually, also pre-compute the scatters because it's too slow
+    a_to_o_projected_by_head = {}
+    for a in a_values:
+        # Get activations
+        sample_pairs = [(a, b, P) for b in b_values]
+        sample_dataset = MyDataset(sample_pairs)
+        sample_dataloader = DataLoader(sample_dataset, batch_size=len(sample_dataset))
+        z_values_by_head = get_z_vectors_by_head(model, sample_dataloader)
+
+        o_projected_by_head = {}
+
+        for head_i in range(num_heads + 1):
+            if head_i < num_heads:
+                W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head].T    # shape (d_model, d_head)
+                new_basis = head_to_new_basis[head_i]
+
+                z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
+                o_values_this_head = z_values_this_head @ W_O_this_head         # shape (b, num_tokens, d_model)
+                # Only want to focus on the `=` token
+                o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
+            
+                o_values_projected = (o_values_this_head @ new_basis).numpy()
+            else:
+                # Last plot (summed)
+                o_values_projected = np.vstack([projected[None,:,:] for projected in o_projected_by_head.values()])
+                o_values_projected = np.sum(o_values_projected, axis=0)
+
+            # Inner cache
+            o_projected_by_head[head_i] = o_values_projected
+
+        # Cache
+        a_to_o_projected_by_head[a] = o_projected_by_head
+
+
+    fig, axes = plt.subplots(nrows=2, ncols=num_heads + 1, figsize=(14, 6))
+    SCATTER_SIZE = 20
+    SCATTER_ALPHA = 0.7
+    cmap = plt.get_cmap('coolwarm', 7)
+    PETAL_Z = 0.6
+    CIRCLE_Z = num_heads * PETAL_Z
+
+    def update(frame_num):
+        a = a_values[frame_num]
+        o_projected_by_head = a_to_o_projected_by_head[a]
+
+        for head_i in range(num_heads + 1):
+            # Clear axes
+            scatter_ax = axes[0, head_i]
+            interpolation_ax = axes[1, head_i]
+            scatter_ax.clear()
+            interpolation_ax.clear()
+
+            o_values_projected = o_projected_by_head[head_i]
+
+            if head_i < num_heads:
+                ax_title = f'attn head {head_i} only'
+                z = PETAL_Z
+                scatter_color = cmap(2)
+            else:
+                ax_title = 'overall / summed'
+                z = CIRCLE_Z
+                scatter_color = cmap(5)
+
+            scatter_ax.scatter(
+                o_values_projected[:,0],
+                o_values_projected[:,1],
+                color=scatter_color,
+                s=SCATTER_SIZE,
+                alpha=SCATTER_ALPHA
+            )
+            scatter_ax.set_title(ax_title, fontsize=10)
+
+            if gradient_interpolation:
+                lc = get_interpolation(
+                    o_values_projected,
+                    return_line_collection=True,
+                    k=k,
+                )
+                interpolation_ax.add_collection(lc)
+            else:
+                projected_smooth = get_interpolation(
+                    o_values_projected,
+                )
+                interpolation_ax.plot(
+                    projected_smooth[:,0], projected_smooth[:,1], '-', color=scatter_color, linewidth=1.0, alpha=0.4
+                )
+            
+            for ax in [scatter_ax, interpolation_ax]:
+                beautify_ax(ax, xmin=-z, xmax=z, ymin=-z, ymax=z)
+        
+            # Text for displaying a value
+            scatter_ax.text(
+                0.03,
+                0.98,
+                f'a = {a}',
+                transform=scatter_ax.transAxes,
+                verticalalignment='top',
+                fontsize=8,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+            )
+
+    plt.suptitle(
+        f'$\\bf{{o\ vectors}}$\nin 2D subspace corresponding to freq {k} Hz embedding circle',
+        fontsize=11
+    )
+    
+    interval = 150
+    anim = FuncAnimation(fig, update, frames=len(a_values), interval=interval, repeat=True)
+    plt.show()
+
 def inspect_attention_outputs_in_agg(
         model: Transformer,
         k: int,
@@ -963,7 +1139,7 @@ def inspect_attention_outputs_in_agg(
     SCATTER_SIZE = 20
     SCATTER_ALPHA = 0.7
     cmap = plt.get_cmap('coolwarm', 7)
-    Z = 20.0
+    Z = 0.5
     # Calculate the basis transformation that would allow us to visualize in 2D
     o_projected_by_head = {}
     for head_i in range(num_heads + 1):
@@ -1020,9 +1196,7 @@ def inspect_attention_outputs_in_agg(
                 # Only want to focus on the `=` token
                 o_values = o_values_cached[:,-1,:]                      # shape (P, d_model)
                 o_values_projected = (o_values @ new_basis).numpy()     # shape (P, 2)
-                print(o_values_projected)
-            
-                Z = 10.0
+                print(o_values_projected)            
             else:
                 # This should work
                 o_values_projected = np.vstack([projected[None,:,:] for projected in o_projected_by_head.values()])
@@ -1039,7 +1213,7 @@ def inspect_attention_outputs_in_agg(
 
             b1_mag = o_values_projected[:,0]
             b2_mag = o_values_projected[:,1]
-            Z = 20.0
+            Z = 2.0
             color = cmap(5)
             ax_title = 'overall / summed'
 
@@ -2960,11 +3134,18 @@ if __name__ == '__main__':
     # This saves the o / o_projected vectors used in the next function
     # inspect_attention_outputs_in_agg(
     #     model,
-    #     k = 13,
+    #     k = 32,
     #     # o_projected_save_loc=O_PROJECTED_SAVE_LOC.format(k=K)
     #     o_projected_save_loc=None
     # )
+    animate_attention_outputs_in_agg(
+        model,
+        k=43,
+        a_values=list(range(57)),
+        gradient_interpolation=True,
+    )
 
+    # K = 4
     # o_dict = np.load(O_PROJECTED_SAVE_LOC.format(k=K))
     # inspect_attention_outputs_periodic_nature(
     #     model,
@@ -3012,14 +3193,15 @@ if __name__ == '__main__':
     #     model,
     #     a_values = [i for i in range(57)],
     #     k_values = [4, 32, 43],
-    #     # hook_point='blocks.0.attn.hook_o',
+    #     hook_point='blocks.0.attn.hook_o',
     #     # hook_point='blocks.0.mlp.hook_post',
-    #     hook_point='blocks.0.hook_mlp_out',
-    #     use_basis_cached=True,
-    #     # use_SV_idxs=[0, 1],
+    #     # hook_point='blocks.0.hook_mlp_out',
+    #     use_basis_cached=False,
+    #     use_SV_idxs=[2, 3],     # To use this, you'll have to set use_basis_cached=False
     #     plot_embeddings=False,
     #     visualize_origin=False,
-    #     Z=200.,
+    #     # Z=200.,
+    #     Z=5.,
     # )
 
     # USELESS
@@ -3054,10 +3236,10 @@ if __name__ == '__main__':
     #     skip_animation=True,
     # )
 
-    show_WL_wrt_MLP_outs(
-        model,
-        k_values = [4, 32, 43],
-        a_values = [i for i in range(57)],
-        expected_ans=83,
-        use_basis_cached=True
-    )
+    # show_WL_wrt_MLP_outs(
+    #     model,
+    #     k_values = [4, 32, 43],
+    #     a_values = [i for i in range(57)],
+    #     expected_ans=83,
+    #     use_basis_cached=True
+    # )
