@@ -2285,7 +2285,7 @@ def o_circles_clockwork(
         plot_subject = f'$\\bf{{MLP\ pre-ReLU\ vectors}}$'
     else:
         raise RuntimeError(f'Unimplemented o_circles_clockwork for {hook_point}')
-    
+
     plt.suptitle(
         f'{plot_subject}\n'
         '-  for specified `a` and all `b` in [0, 113):\n'
@@ -2401,6 +2401,8 @@ def simple_animation(
         z = 150.
     elif hook_point == 'blocks.0.mlp.hook_post':
         z = 50.
+    elif hook_point == 'blocks.0.mlp.hook_pre':
+        z = 50.
     else:
         raise ValueError(f'Not implemented yet for hook_point == {hook_point}')
 
@@ -2424,7 +2426,7 @@ def simple_animation(
         )
         number_feats = einops.rearrange(number_feats, 'b i p h -> b p (i h)')
         number_feats = torch.einsum('df,bqf->bqd', W_O, number_feats)               # shape (P, 1, d_model)
-    
+
         if hook_point in ['blocks.0.mlp.hook_post']:
             # Still have to transform to MLP activations
             W_up = model.blocks[0].mlp.W_up.detach().cpu()                          # shape (d_mlp, d_model)
@@ -3103,6 +3105,172 @@ def guess_W_down(
         plt.show()
         plt.close()
 
+def look_for_unseen_o_components(
+        model,
+        a_values = [i for i in range(57)],
+        k_values = [4, 32, 43],
+        hook_point='blocks.0.mlp.hook_pre',
+):
+    """
+    Remember that when we visualized hook_post / hook_pre (3rd and 4th PCs),
+    we already found the rotational components. I want to figure out which
+    dimensions of o these PCs correspond to.
+    """
+    # Create sample pairs
+    P = 113
+    b_values = list(range(P))
+
+    # Need W_up to infer directions in o that correspond to 3rd and 4th PC of MLP acts
+    W_up = model.blocks[0].mlp.W_up.detach().cpu()          # shape (d_mlp, d_model)
+    W_V = model.blocks[0].attn.W_V.detach().cpu()
+    W_O = model.blocks[0].attn.W_O.detach().cpu()
+    num_heads, d_head, d_model = W_V.shape
+
+    SCATTER_SIZE = 50
+    SCATTER_ALPHA = 0.7
+    fig, axes = plt.subplots(nrows=len(k_values), ncols=num_heads + 1, figsize=(14, 6))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array(axes)
+    axes = axes.flatten()
+
+    # These are the basis vecs of hook_point, where hook_point is either
+    # hook_pre or hook_post
+    k_to_a_to_basis_vecs = {}
+
+    # These are the o output embeddings
+    a_to_embeddings = {}
+    for k_i, k in enumerate(k_values):
+        if k_i != 0:
+            # DEBUG skip
+            continue
+        for a_i, a in enumerate(a_values):
+            sample_pairs = [(a, b, P) for b in b_values]
+
+            # Make the dataloader (full batch)
+            sample_dataset = MyDataset(sample_pairs)
+            sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+            # Install the attn activation cache
+            cache = {}
+            model.remove_all_hooks()
+            model.cache_all(cache)
+
+            # Forward pass and collect the activations
+            model.eval()
+            hook_point_embeddings_cached = None
+            o_embeddings_cached = None
+
+            for batch_x, _ in sample_dataloader:
+                _ = model(batch_x)
+                hook_point_embeddings_cached = cache[hook_point]        # (b, num_tokens, d_mlp)
+                o_embeddings_cached = cache['blocks.0.attn.hook_o']     # (b, num_tokens, d_model)
+            hook_point_embeddings = hook_point_embeddings_cached[:,-1,:]
+            o_embeddings = o_embeddings_cached[:,-1,:]
+
+            # Always calculate the unique basis
+            k_to_basis_vecs = get_embeddings_circle_bases(
+                hook_point_embeddings,
+                k_values=[k]
+            )
+
+            if a not in a_to_embeddings:
+                a_to_embeddings[a] = o_embeddings
+
+            basis_vecs = k_to_basis_vecs[k]
+            a_to_basis_vecs = k_to_a_to_basis_vecs.get(k, {})
+            a_to_basis_vecs[a] = basis_vecs
+            k_to_a_to_basis_vecs[k] = a_to_basis_vecs
+
+    def update(frame):
+        for ax in axes:
+            ax.clear()
+
+        a = a_values[frame]
+
+        # Precompute this nonsense in order to get the plots working.
+        # Once working, we should be able to see the components of the petals
+        # corresponding to the 3rd and 4th PC of the MLP block. From there, we
+        # can make the argument that the attention layer immediately shits out
+        # a rotational component.
+        z_values_by_head = get_z_vectors_by_head(model, sample_dataloader)
+        for k_i, k in enumerate(k_values):
+            if k_i != 0:
+                continue
+            for head_i in range(num_heads + 1):
+                ax = axes[k_i * num_heads + head_i]
+
+                bases = [b for b in k_to_a_to_basis_vecs[k].values()]
+                basis_matrix = np.concatenate(bases, axis=1)                    # shape (d_model / d_mlp, a * 2)
+                U, S, Vt = np.linalg.svd(basis_matrix, full_matrices=False)
+                basis_vecs = U[:, [2, 3]]                                       # shape (d_mlp, 2)
+                basis_vecs_o_space = W_up.T @ basis_vecs
+
+                if head_i < num_heads:
+                    W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head]  # shape (d_model, d_head)
+                    # shape (d_model, 2)
+
+                    # What are the z embeddings w.r.t to basis_vecs_o_space?
+                    z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
+                    o_values_this_head = z_values_this_head @ W_O_this_head.T       # shape (b, num_tokens, d_model)
+                    # Only want to focus on the `=` token
+                    o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
+                
+                    o_values_projected = (o_values_this_head @ basis_vecs_o_space).numpy()
+                    # Do scatter
+                    # We do milli_periods because cmaps can't give us decimal periods
+                    milli_period = int(1000 * P / k)
+                    cmap = plt.get_cmap('coolwarm', milli_period)
+                    colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+
+                    ax.scatter(o_values_projected[:,0], o_values_projected[:,1], color=colors, s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
+
+                else:
+                    embeddings_projected = a_to_embeddings[a] @ basis_vecs_o_space
+
+                    b1_mag = embeddings_projected[:,0]
+                    b2_mag = embeddings_projected[:,1]
+
+                    # We do milli_periods because cmaps can't give us decimal periods
+                    milli_period = int(1000 * P / k)
+                    cmap = plt.get_cmap('coolwarm', milli_period)
+                    colors = [cmap(i * 1000 % milli_period) for i in range(P)]
+
+                    # Do scatter
+                    ax.scatter(b1_mag, b2_mag, color=colors, s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
+                
+                    # Text for displaying a value
+                    ax.text(
+                        0.03,
+                        0.98,
+                        f'a = {a}',
+                        transform=ax.transAxes,
+                        verticalalignment='top',
+                        fontsize=8,
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+                    )
+
+                # # Title
+                # ax.set_title(f'freq {k} Hz embedding circle')
+
+        for ax in axes:
+            z = 30.
+            beautify_ax(ax, -z, z, -z, z)
+
+    # plt.suptitle(
+    #     f'{plot_subject}\n'
+    #     '-  for specified `a` and all `b` in [0, 113):\n'
+    #     f'{subspace_description}',
+    #     fontsize=11,
+    #     ha='left',
+    #     x=0.23,
+    #     y=0.95,
+    # )
+
+    anim = FuncAnimation(fig, update, frames=len(a_values), interval=150, repeat=True)
+    plt.show()
+
+
+
 if __name__ == '__main__':
     CHECKPOINT_FILE = 'checkpoints/grokked_20k/epoch_19999.pt'
     # CHECKPOINT_FILE = 'checkpoints/grokked_reluless/epoch_19999.pt'
@@ -3138,12 +3306,12 @@ if __name__ == '__main__':
     #     # o_projected_save_loc=O_PROJECTED_SAVE_LOC.format(k=K)
     #     o_projected_save_loc=None
     # )
-    animate_attention_outputs_in_agg(
-        model,
-        k=43,
-        a_values=list(range(57)),
-        gradient_interpolation=True,
-    )
+    # animate_attention_outputs_in_agg(
+    #     model,
+    #     k=43,
+    #     a_values=list(range(57)),
+    #     gradient_interpolation=True,
+    # )
 
     # K = 4
     # o_dict = np.load(O_PROJECTED_SAVE_LOC.format(k=K))
@@ -3181,7 +3349,7 @@ if __name__ == '__main__':
     #     anchor_points = [],
     #     k = 4,
     #     # k=13,
-    #     # hook_point='blocks.0.hook_mlp_out'
+    #     # hook_point='blocks.0.hook_mlp_out',
     #     # hook_point='blocks.0.mlp.hook_post',
     #     hook_point='blocks.0.attn.hook_o',
     #     plot_embeddings=True,
@@ -3193,15 +3361,17 @@ if __name__ == '__main__':
     #     model,
     #     a_values = [i for i in range(57)],
     #     k_values = [4, 32, 43],
-    #     hook_point='blocks.0.attn.hook_o',
+    #     # hook_point='blocks.0.attn.hook_o',
+    #     hook_point='blocks.0.mlp.hook_pre',
     #     # hook_point='blocks.0.mlp.hook_post',
     #     # hook_point='blocks.0.hook_mlp_out',
     #     use_basis_cached=False,
     #     use_SV_idxs=[2, 3],     # To use this, you'll have to set use_basis_cached=False
     #     plot_embeddings=False,
     #     visualize_origin=False,
+    #     # Z=5.,
     #     # Z=200.,
-    #     Z=5.,
+    #     # Z=30.,
     # )
 
     # USELESS
@@ -3243,3 +3413,14 @@ if __name__ == '__main__':
     #     expected_ans=83,
     #     use_basis_cached=True
     # )
+
+    look_for_unseen_o_components(
+        model,
+        a_values = [i for i in range(57)],
+        k_values = [4, 32, 43],
+        hook_point='blocks.0.mlp.hook_pre',
+        # hook_point='blocks.0.mlp.hook_post',
+        # Z=5.,
+        # Z=200.,
+        # Z=30.,
+    )
