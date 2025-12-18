@@ -3110,6 +3110,7 @@ def look_for_unseen_o_components(
         a_values = [i for i in range(57)],
         k_values = [4, 32, 43],
         hook_point='blocks.0.mlp.hook_pre',
+        gradient_interpolation: bool = True,
 ):
     """
     Remember that when we visualized hook_post / hook_pre (3rd and 4th PCs),
@@ -3121,14 +3122,17 @@ def look_for_unseen_o_components(
     b_values = list(range(P))
 
     # Need W_up to infer directions in o that correspond to 3rd and 4th PC of MLP acts
-    W_up = model.blocks[0].mlp.W_up.detach().cpu()          # shape (d_mlp, d_model)
+    W_up = model.blocks[0].mlp.W_up.detach().cpu().numpy()  # shape (d_mlp, d_model)
     W_V = model.blocks[0].attn.W_V.detach().cpu()
     W_O = model.blocks[0].attn.W_O.detach().cpu()
     num_heads, d_head, d_model = W_V.shape
 
-    SCATTER_SIZE = 50
+    SCATTER_SIZE = 20
     SCATTER_ALPHA = 0.7
-    fig, axes = plt.subplots(nrows=len(k_values), ncols=num_heads + 1, figsize=(14, 6))
+    NROWS = len(k_values)
+    NCOLS = num_heads + 1
+    BLUE = plt.get_cmap('coolwarm', 7)(2)
+    fig, axes = plt.subplots(nrows=NROWS, ncols=NCOLS, figsize=(14, 9))
     if not isinstance(axes, np.ndarray):
         axes = np.array(axes)
     axes = axes.flatten()
@@ -3137,12 +3141,12 @@ def look_for_unseen_o_components(
     # hook_pre or hook_post
     k_to_a_to_basis_vecs = {}
 
-    # These are the o output embeddings
-    a_to_embeddings = {}
+    a_to_embeddings = {}        # These are the o output embeddings
+    a_to_z_values_by_head = {}
+
+    # We have to do 1 pass first to accumulate all the Fourier-inferred
+    # 2D bases at the hook points
     for k_i, k in enumerate(k_values):
-        if k_i != 0:
-            # DEBUG skip
-            continue
         for a_i, a in enumerate(a_values):
             sample_pairs = [(a, b, P) for b in b_values]
 
@@ -3159,13 +3163,22 @@ def look_for_unseen_o_components(
             model.eval()
             hook_point_embeddings_cached = None
             o_embeddings_cached = None
+            z_values_cached = None
 
             for batch_x, _ in sample_dataloader:
                 _ = model(batch_x)
                 hook_point_embeddings_cached = cache[hook_point]        # (b, num_tokens, d_mlp)
                 o_embeddings_cached = cache['blocks.0.attn.hook_o']     # (b, num_tokens, d_model)
+                z_values_cached = cache['blocks.0.attn.hook_z']                # (b, num_heads, pos, d_head)
+
+            # Select the relevant tokens / embeddings
             hook_point_embeddings = hook_point_embeddings_cached[:,-1,:]
             o_embeddings = o_embeddings_cached[:,-1,:]
+            z_values_by_head = {}
+            _, num_heads, _, _ = z_values_cached.shape
+            for i in range(num_heads):
+                    # (b, num_tokens, d_head)
+                    z_values_by_head[f'head_{i}'] = z_values_cached[:, i, :, :]
 
             # Always calculate the unique basis
             k_to_basis_vecs = get_embeddings_circle_bases(
@@ -3175,11 +3188,44 @@ def look_for_unseen_o_components(
 
             if a not in a_to_embeddings:
                 a_to_embeddings[a] = o_embeddings
+            if a not in a_to_z_values_by_head:
+                a_to_z_values_by_head[a] = z_values_by_head
 
             basis_vecs = k_to_basis_vecs[k]
             a_to_basis_vecs = k_to_a_to_basis_vecs.get(k, {})
             a_to_basis_vecs[a] = basis_vecs
             k_to_a_to_basis_vecs[k] = a_to_basis_vecs
+
+    # Keep on pre-computing...
+    k_to_a_to_o_values_projected_by_head = {}
+    for k_i, k in enumerate(k_values):
+        a_to_o_values_projected_by_head = {}
+        for a_i, a in enumerate(a_values):
+
+            z_values_by_head = a_to_z_values_by_head[a]
+            o_values_projected_by_head = {}
+            for head_i in range(num_heads):
+                W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head]  # shape (d_model, d_head)
+                # shape (d_model, 2)
+
+                # What are the z embeddings w.r.t to basis_vecs_o_space?
+                z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
+                o_values_this_head = z_values_this_head @ W_O_this_head.T       # shape (b, num_tokens, d_model)
+                # Only want to focus on the `=` token
+                o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
+
+                bases = [b for b in k_to_a_to_basis_vecs[k].values()]
+                basis_matrix = np.concatenate(bases, axis=1)                    # shape (d_model / d_mlp, a * 2)
+                U, S, Vt = np.linalg.svd(basis_matrix, full_matrices=False)
+                basis_vecs = U[:, [2, 3]]                                       # shape (d_mlp, 2)
+                basis_vecs_o_space = W_up.T @ basis_vecs
+
+                o_values_projected = (o_values_this_head @ basis_vecs_o_space).numpy()
+                o_values_projected_by_head[head_i] = o_values_projected
+            a_to_o_values_projected_by_head[a] = o_values_projected_by_head
+        k_to_a_to_o_values_projected_by_head[k] = a_to_o_values_projected_by_head
+
+    print('alpha')
 
     def update(frame):
         for ax in axes:
@@ -3192,30 +3238,19 @@ def look_for_unseen_o_components(
         # corresponding to the 3rd and 4th PC of the MLP block. From there, we
         # can make the argument that the attention layer immediately shits out
         # a rotational component.
-        z_values_by_head = get_z_vectors_by_head(model, sample_dataloader)
         for k_i, k in enumerate(k_values):
-            if k_i != 0:
-                continue
-            for head_i in range(num_heads + 1):
-                ax = axes[k_i * num_heads + head_i]
 
-                bases = [b for b in k_to_a_to_basis_vecs[k].values()]
-                basis_matrix = np.concatenate(bases, axis=1)                    # shape (d_model / d_mlp, a * 2)
-                U, S, Vt = np.linalg.svd(basis_matrix, full_matrices=False)
-                basis_vecs = U[:, [2, 3]]                                       # shape (d_mlp, 2)
-                basis_vecs_o_space = W_up.T @ basis_vecs
+            a_to_o_values_projected_by_head = k_to_a_to_o_values_projected_by_head[k]
+            o_values_projected_by_head = a_to_o_values_projected_by_head[a]
 
-                if head_i < num_heads:
-                    W_O_this_head = W_O[:, head_i * d_head: (head_i + 1) * d_head]  # shape (d_model, d_head)
-                    # shape (d_model, 2)
+            for col_idx in range(NCOLS):
+                ax = axes[k_i * NCOLS  + col_idx]
 
-                    # What are the z embeddings w.r.t to basis_vecs_o_space?
-                    z_values_this_head = z_values_by_head[f'head_{head_i}']         # shape (b, num_tokens, d_head)
-                    o_values_this_head = z_values_this_head @ W_O_this_head.T       # shape (b, num_tokens, d_model)
-                    # Only want to focus on the `=` token
-                    o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
-                
-                    o_values_projected = (o_values_this_head @ basis_vecs_o_space).numpy()
+                if col_idx < num_heads:
+                    head_i = col_idx
+
+                    o_values_projected = o_values_projected_by_head[head_i]
+
                     # Do scatter
                     # We do milli_periods because cmaps can't give us decimal periods
                     milli_period = int(1000 * P / k)
@@ -3224,7 +3259,51 @@ def look_for_unseen_o_components(
 
                     ax.scatter(o_values_projected[:,0], o_values_projected[:,1], color=colors, s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
 
+                    if gradient_interpolation:
+                        lc = get_interpolation(
+                            o_values_projected,
+                            return_line_collection=True,
+                            k=k,
+                        )
+                        ax.add_collection(lc)
+                    else:
+                        projected_smooth = get_interpolation(
+                            o_values_projected,
+                        )
+                        ax.plot(
+                            projected_smooth[:,0], projected_smooth[:,1], '-', color=BLUE, linewidth=1.0, alpha=0.4
+                        )
+
+                elif col_idx == num_heads:
+                    o_values_projected_all_heads = np.array(list(o_values_projected_by_head.values()))
+                    o_values_projected_aggregated = np.sum(o_values_projected_all_heads, axis=0)
+
+                    # Do scatter
+                    ax.scatter(
+                        o_values_projected_aggregated[:,0],
+                        o_values_projected_aggregated[:,1],
+                        color=colors,
+                        s=SCATTER_SIZE,
+                        alpha=SCATTER_ALPHA
+                    )
+                
+                    # Text for displaying a value
+                    ax.text(
+                        0.03,
+                        0.98,
+                        f'a = {a}',
+                        transform=ax.transAxes,
+                        verticalalignment='top',
+                        fontsize=8,
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+                    )
                 else:
+                    raise
+                    # OLD LOGIC
+                    # ---------
+                    # if NCOLS == num_heads + 2, we never make it to this branch.
+                    # But turns out, the embeddings here are exactly the same as in the col_idx == num_heads
+                    # method of computation. Makes sense.
                     embeddings_projected = a_to_embeddings[a] @ basis_vecs_o_space
 
                     b1_mag = embeddings_projected[:,0]
@@ -3249,22 +3328,44 @@ def look_for_unseen_o_components(
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8)
                     )
 
-                # # Title
-                # ax.set_title(f'freq {k} Hz embedding circle')
+                if col_idx == 0:
+                    fig.text(
+                        0.09,                   # x position (left side of figure)
+                        0.79 - k_i * 0.275,    # y position (adjust spacing as needed)
+                        f'{k} Hz',
+                        fontsize=10,
+                        verticalalignment='center',
+                        rotation=90
+                    )
+                
+                if k_i == 0:
+                    if col_idx < num_heads:
+                        ax_title = f'attn head {head_i} only'
+                    else:
+                        ax_title = f'overall / summed'
+
+                    ax.set_title(ax_title, fontsize=8)
 
         for ax in axes:
-            z = 30.
+            z = 25.
             beautify_ax(ax, -z, z, -z, z)
 
-    # plt.suptitle(
-    #     f'{plot_subject}\n'
-    #     '-  for specified `a` and all `b` in [0, 113):\n'
-    #     f'{subspace_description}',
-    #     fontsize=11,
-    #     ha='left',
-    #     x=0.23,
-    #     y=0.95,
-    # )
+    plot_subject = f'$\\bf{{o\ vectors\ (for\ token\ =)}}$\n'
+    plot_subject += '  - for specified `a` and all `b` in [0, 113]\n'
+    if hook_point == 'blocks.0.mlp.hook_post':
+        plot_subject += '  - in 2D subspace corresponding to 3rd & 4th PCs of all k-Hz circles in post-ReLU MLP embeddings'
+    elif hook_point == 'blocks.0.mlp.hook_pre':
+        plot_subject += '  - in 2D subspace corresponding to 3rd & 4th PCs of all k-Hz circles in pre-ReLU MLP embeddings'
+    else:
+        raise RuntimeError(f'Unimplemented o_circles_clockwork for {hook_point}')
+    
+    plt.suptitle(
+        plot_subject,
+        fontsize=11,
+        ha='left',
+        x=0.23,
+        y=0.98,
+    )
 
     anim = FuncAnimation(fig, update, frames=len(a_values), interval=150, repeat=True)
     plt.show()
