@@ -209,14 +209,34 @@ class TransformerBlock(nn.Module):
             n_ctx: int = N_CTX,
             act_type: str = ACT_TYPE,
             replace_mlp_with_reluless: bool = False,
+            ablate_o_subspace: torch.Tensor | np.ndarray | None = None,
     ):
+        """
+        @param ablate_o_subspace:       a matrix whose column space we want to project
+                                        out of the mlp input
+        """
         super().__init__()
         self.attn = Attention(d_model, num_heads, d_head, n_ctx)
         self.mlp = MLP(d_model, d_mlp, act_type, replace_mlp_with_reluless)
         self.hook_mlp_out = HookPoint()
+        self.ablation_matrix = None
+
+    def install_ablation_matrix(self, ablation_matrix: torch.Tensor):
+        """
+        ablation_matrix follows math convention, in that it's supposed to be applied
+        on the left of the operand.
+        """
+        self.ablation_matrix = ablation_matrix
 
     def forward(self, x):
+        """
+        @param x:   shape (b, n_tokens, d_model)
+        """
         x = x + self.attn(x)                        # resid_mid
+
+        if isinstance(self.ablation_matrix, torch.Tensor):
+            x = x @ self.ablation_matrix.T
+
         x = x + self.hook_mlp_out(self.mlp(x))      # resid_post
         return x
 
@@ -293,6 +313,9 @@ class Transformer(nn.Module):
             x = block(x)
         x = self.unembed(x)
         return x
+    
+    def install_ablation_matrix(self, ablation_matrix: torch.Tensor):
+        self.blocks[0].install_ablation_matrix(ablation_matrix)
 
 class MyDataset(Dataset):
     def __init__(self, pairs: list[tuple]):
@@ -457,7 +480,7 @@ def train(
 
         model.eval()
         epoch_test_loss = 0.0
-        epoch_num_correct = 1.0
+        epoch_num_correct = 0.0
         for batch_x, batch_y in test_dataloader:
             # forward pass
             logits = model(batch_x)[:,-1,:] # only take the last position

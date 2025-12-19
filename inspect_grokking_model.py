@@ -2,6 +2,7 @@
 Desc:   Having trained the model to grok the modulo arithmetic problem, we want to:
         1.  Confirm the existence of periodic structure
 """
+import copy
 from pathlib import Path
 import pickle
 import random
@@ -20,6 +21,7 @@ from scipy.linalg import subspace_angles
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from grokking_model import MyDataset
 from grokking_model import Transformer
@@ -1947,30 +1949,6 @@ def show_WL_wrt_MLP_outs(
                 xytext=(3, 3),
                 textcoords='offset points',
             )
-        
-        # # Annotate expected_ans
-        # annotation_offset = annotation_offsets[ax_i]
-        # draw_line(
-        #     ax,
-        #     embeddings_projected[expected_b],
-        #     embeddings_projected[expected_b] + annotation_offset,
-        #     line_kwargs = {
-        #         'linewidth': 1,
-        #         'color': 'black',
-        #         'alpha': 0.7,
-        #         'zorder': 10 
-        #     }
-        # )
-        # ax.annotate(
-        #     str(expected_b),
-        #     (b1_mag[expected_b], b2_mag[expected_b]),
-        #     fontsize=15,
-        #     color='white',
-        #     alpha=0.7,
-        #     xytext=(b1_mag[expected_b] + annotation_offset[0], b2_mag[expected_b] + annotation_offset[1]),
-        #     textcoords='data',
-        #     bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
-        # )
 
         LINEWIDTH = 1
         COLOR = 'dimgray'
@@ -1991,7 +1969,7 @@ def show_WL_wrt_MLP_outs(
             line_kwargs=line_kwargs
         )
         ax.annotate(
-            f'$\\bf{{W\_L[{expected_ans}]}}$',
+            f'$\\bf{{W\_U[{expected_ans}]}}$',
             ans_feat_projected * ans_feat_magnification,
             fontsize=10,
             alpha=1.0,
@@ -2257,7 +2235,7 @@ def o_circles_clockwork(
                 line_kwargs=line_kwargs
             )
             ax.annotate(
-                f'$\\bf{{W\_L[{expected_ans}]}}$',
+                f'$\\bf{{W\_U[{expected_ans}]}}$',
                 ans_feat_projected * 0.7,
                 fontsize=10,
                 alpha=0.7,
@@ -3371,6 +3349,104 @@ def look_for_unseen_o_components(
     plt.show()
 
 
+def ablate_and_measure_performance(
+        model: Transformer,
+        a_values = [i for i in range(57)],
+        k_values = [4, 32, 43],
+        hook_point='blocks.0.mlp.hook_pre',
+        use_PC_idxs = [2, 3],
+):
+    """
+    Remember that when we visualized hook_post / hook_pre (3rd and 4th PCs),
+    we already found the rotational components. I want to figure out which
+    dimensions of o these PCs correspond to.
+    """
+    # Create sample pairs
+    P = 113
+    b_values = list(range(P))
+
+    # Need W_up to infer directions in o that correspond to 3rd and 4th PC of MLP acts
+    W_up = model.blocks[0].mlp.W_up.detach().cpu().numpy()  # shape (d_mlp, d_model)
+    W_V = model.blocks[0].attn.W_V.detach().cpu()
+    num_heads, d_head, d_model = W_V.shape
+
+    # These are the basis vecs of hook_point, where hook_point is either
+    # hook_pre or hook_post
+    k_to_a_to_basis_vecs = {}
+
+    # We have to do 1 pass first to accumulate all the Fourier-inferred
+    # 2D bases at the hook points
+    for k_i, k in enumerate(k_values):
+        for a_i, a in enumerate(a_values):
+            sample_pairs = [(a, b, P) for b in b_values]
+
+            # Make the dataloader (full batch)
+            sample_dataset = MyDataset(sample_pairs)
+            sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
+
+            # Install the attn activation cache
+            cache = {}
+            model.remove_all_hooks()
+            model.cache_all(cache)
+
+            # Forward pass and collect the activations
+            model.eval()
+            hook_point_embeddings_cached = None
+
+            for batch_x, _ in sample_dataloader:
+                _ = model(batch_x)
+                hook_point_embeddings_cached = cache[hook_point]        # (b, num_tokens, d_mlp)
+
+            # Select the relevant tokens / embeddings
+            hook_point_embeddings = hook_point_embeddings_cached[:,-1,:]
+
+            # Always calculate the unique basis
+            k_to_basis_vecs = get_embeddings_circle_bases(
+                hook_point_embeddings,
+                k_values=[k]
+            )
+
+            basis_vecs = k_to_basis_vecs[k]
+            a_to_basis_vecs = k_to_a_to_basis_vecs.get(k, {})
+            a_to_basis_vecs[a] = basis_vecs
+            k_to_a_to_basis_vecs[k] = a_to_basis_vecs
+
+    # Keep on pre-computing...
+    k_to_basis_vecs_o_space = {}
+    for k_i, k in enumerate(k_values):
+        bases = [b for b in k_to_a_to_basis_vecs[k].values()]
+        basis_matrix = np.concatenate(bases, axis=1)                    # shape (d_model / d_mlp, a * 2)
+        U, S, Vt = np.linalg.svd(basis_matrix, full_matrices=False)
+        basis_vecs = U[:, use_PC_idxs]                                       # shape (d_mlp, 2)
+        basis_vecs_o_space = W_up.T @ basis_vecs
+        k_to_basis_vecs_o_space[k] = basis_vecs_o_space
+
+    ablated_model = copy.deepcopy(model)
+
+    # Ablate ALL rotational circle components
+    span_to_ablate = np.concatenate([b for b in k_to_basis_vecs_o_space.values()], axis=1)
+    span_to_ablate = torch.Tensor(span_to_ablate)
+    ablation_matrix = torch.eye(d_model) - \
+        span_to_ablate @ torch.linalg.inv(span_to_ablate.T @ span_to_ablate) @ span_to_ablate.T
+
+    ablated_model.install_ablation_matrix(ablation_matrix)
+
+    all_pairs = [(i, j, P) for i in range(P) for j in range(P)]
+    test_dataset = MyDataset(all_pairs)
+    test_dataloader = DataLoader(test_dataset, batch_size = len(test_dataset))
+    ablated_model.eval()
+    epoch_num_correct = 0.0
+    for batch_x, batch_y in tqdm(test_dataloader):
+        # forward pass
+        logits = ablated_model(batch_x)[:,-1,:] # only take the last position
+        preds = torch.argmax(logits, dim=-1)
+        num_correct = (preds == batch_y).sum().item()
+        epoch_num_correct += num_correct
+
+    epoch_test_acc = epoch_num_correct / len(test_dataset)
+
+    print(f'ablated test acc: {epoch_test_acc}, i.e. {epoch_num_correct} / {len(test_dataset)}')
+
 
 if __name__ == '__main__':
     CHECKPOINT_FILE = 'checkpoints/grokked_20k/epoch_19999.pt'
@@ -3507,21 +3583,29 @@ if __name__ == '__main__':
     #     skip_animation=True,
     # )
 
-    # show_WL_wrt_MLP_outs(
+    show_WL_wrt_MLP_outs(
+        model,
+        k_values = [4, 32, 43],
+        a_values = [i for i in range(57)],
+        expected_ans=65,
+        use_basis_cached=True
+    )
+
+    # look_for_unseen_o_components(
     #     model,
-    #     k_values = [4, 32, 43],
     #     a_values = [i for i in range(57)],
-    #     expected_ans=83,
-    #     use_basis_cached=True
+    #     k_values = [4, 32, 43],
+    #     hook_point='blocks.0.mlp.hook_pre',
+    #     # hook_point='blocks.0.mlp.hook_post',
+    #     # Z=5.,
+    #     # Z=200.,
+    #     # Z=30.,
     # )
 
-    look_for_unseen_o_components(
-        model,
-        a_values = [i for i in range(57)],
-        k_values = [4, 32, 43],
-        hook_point='blocks.0.mlp.hook_pre',
-        # hook_point='blocks.0.mlp.hook_post',
-        # Z=5.,
-        # Z=200.,
-        # Z=30.,
-    )
+    # ablate_and_measure_performance(
+    #     model,
+    #     a_values = [i for i in range(57)],
+    #     k_values = [4, 32, 43],
+    #     hook_point='blocks.0.mlp.hook_pre',
+    #     use_PC_idxs=[0, 1, 2, 3],
+    # )
