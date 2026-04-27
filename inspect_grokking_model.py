@@ -203,7 +203,8 @@ def get_fourier_coeffs_by_hand(W: torch.Tensor, P: int) -> torch.Tensor:
 def inspect_periodic_nature(
         model: Transformer,
         weight_matrix: str = 'W_E',
-        do_DFT_by_hand: bool = False
+        do_DFT_by_hand: bool = False,
+        ax: plt.Axes | None = None,
     ):
     """
     We want to see high-magnitude fourier components for:
@@ -225,7 +226,9 @@ def inspect_periodic_nature(
 
     _, P = W.shape
 
-    _, ax = plt.subplots(1, 1, figsize=(12, 4))
+    standalone = ax is None
+    if standalone:
+        _, ax = plt.subplots(1, 1, figsize=(12, 4))
     cmap = plt.get_cmap('coolwarm', 7)
 
     if do_DFT_by_hand:
@@ -236,32 +239,112 @@ def inspect_periodic_nature(
         x_ticks = [i for i in range(0, P, 10)]
         x_tick_labels = [i // 2 for i in range(0, P, 10)]
 
+        coeff_norms = fourier_coeff_norms[1:].numpy()
         colors = [cmap(2) if i % 2 == 0 else cmap(5) for i in range(P)]
-        ax.bar(x_axis, fourier_coeff_norms[1:], width=0.6, color=colors)
+        ax.bar(x_axis, coeff_norms, width=0.6, color=colors)
         ax.set_xticks(x_ticks)
         ax.set_xticklabels(x_tick_labels)
     else:
         # coeffs[:,0] is the DC freq.
         # If num timesteps is even, coeffs[:,-1] is the Nyquist frequency (ignore)
         fft_coeffs = np.fft.rfft(W, axis=-1)                    # shape (d_model, d_vocab // 2)
-        fft_coeffs_normed = np.linalg.norm(fft_coeffs, axis=0)  # shape (d_vocab // 2,)
+        coeff_norms = np.linalg.norm(fft_coeffs, axis=0)        # shape (d_vocab // 2,)
 
-        x_axis = np.linspace(1, len(fft_coeffs_normed), len(fft_coeffs_normed))
+        x_axis = np.linspace(1, len(coeff_norms), len(coeff_norms))
 
-        ax.bar(x_axis, fft_coeffs_normed, width=0.5, color=cmap(2))
+        ax.bar(x_axis, coeff_norms, width=0.5, color=cmap(2))
 
     ax.set_ylabel('Relative Norm of Coefficients')
     ax.set_xlabel('Frequency multiple (k)')
     ax.set_facecolor(BACKGROUND_COLOR)
+
+    if standalone:
+        plt.show()
+    return (None if standalone else ax), x_axis, coeff_norms
+
+def _load_checkpoints(checkpoints_dir: str, checkpoint_stride: int) -> list[Path]:
+    """Sort checkpoints numerically and filter by stride."""
+    all_checkpoints = sorted(
+        Path(checkpoints_dir).glob('*.pt'),
+        key=lambda p: int(p.stem.split('_')[-1])
+    )
+    return [
+        p for p in all_checkpoints
+        if (int(p.stem.split('_')[-1]) + 1) % checkpoint_stride == 0
+    ]
+
+
+def inspect_evolving_periodic_nature(
+        checkpoints_dir: str,
+        checkpoint_stride: int = 200,
+        weight_matrix: str = 'W_E',
+        do_DFT_by_hand: bool = True,
+        ymax: float = 5.0,
+):
+    """
+    Create a slider of fourier coefficient plots over checkpoints
+    """
+    checkpoints = _load_checkpoints(checkpoints_dir, checkpoint_stride)
+
+    # Step 3: Initialize shared variables: the cache, figure, ax, and slider.
+    # The cache is populated in step 4; update() reads from it.
+    frame_cache: dict[int, dict] = {}
+    cmap = plt.get_cmap('coolwarm', 7)
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    plt.subplots_adjust(bottom=0.2)
+    ax_slider = fig.add_axes([0.15, 0.05, 0.7, 0.03])
+    slider = plt.Slider(ax_slider, 'Frame', 0, len(checkpoints) - 1, valinit=0, valstep=1)
+
+    # Step 4: Iterate over all checkpoints, populate cache, then wire up slider.
+    model = Transformer()
+    for frame_idx, ckpt_path in enumerate(tqdm(checkpoints, desc='Pre-computing frames')):
+        chkpt_dict = torch.load(ckpt_path, weights_only=False)
+        model.load_state_dict(chkpt_dict['model_state_dict'])
+
+        tmp_fig, tmp_ax = plt.subplots()
+        _, x_axis, coeff_norms = inspect_periodic_nature(
+            model, weight_matrix=weight_matrix, do_DFT_by_hand=do_DFT_by_hand, ax=tmp_ax
+        )
+        plt.close(tmp_fig)
+
+        frame_cache[frame_idx] = {
+            'x_axis':      x_axis,
+            'coeff_norms': coeff_norms,
+            'epoch':       int(ckpt_path.stem.split('_')[-1]),
+        }
+
+    def update(val):
+        frame_idx = int(val)
+        data = frame_cache[frame_idx]
+        ax.clear()
+        width = 0.6 if do_DFT_by_hand else 0.5
+        colors = [
+            cmap(2) if i % 2 == 0 else cmap(5) \
+            for i in range(len(data['coeff_norms']))
+        ] if do_DFT_by_hand else cmap(2)
+        ax.bar(data['x_axis'], data['coeff_norms'], width=width, color=colors)
+        ax.set_ylim(0, ymax)
+        ax.set_ylabel('Relative Norm of Coefficients')
+        ax.set_xlabel('Frequency multiple (k)')
+        ax.set_facecolor(BACKGROUND_COLOR)
+        ax.set_title(f'Epoch {data["epoch"]}', fontsize=10)
+        fig.canvas.draw_idle()
+
+    slider.on_changed(update)
+    update(0)
     plt.show()
+
 
 def inspect_PCA_W_E(
         model: Transformer,
         k_vals: list[int],
         weight_matrix: str = 'W_E',
+        z: float = 10.0
     ):
     """
-    @param k_vals:  List of frequency multiples
+    @param k_vals:  List of frequency multiples,
+    @param z:       radius of plot
     """
     for k in k_vals:
         assert k > 0, 'frequency_multiple k must be > 0'
@@ -288,7 +371,6 @@ def inspect_PCA_W_E(
 
     fourier_coeffs = get_fourier_coeffs_by_hand(W, P)
 
-    z = 10.
     for idx, k in enumerate(k_vals):
         print(f'\n🔍 Inspecting PCA for W for k = {k}...')
 
@@ -344,6 +426,118 @@ def inspect_PCA_W_E(
             fontsize=10
         )
 
+    plt.show()
+
+def inspect_evolving_PCA_W(
+        checkpoints_dir: str,
+        checkpoint_stride: int = 200,
+        weight_matrix: str = 'W_E',
+        k_vals: list[int] = None,
+        z: float = 10.0,
+):
+    """
+    Create a slider of 2D plots showing circles in their respective spaces.
+    The Fourier basis vectors are computed once from the last checkpoint and
+    reused for every frame.
+    """
+    if k_vals is None:
+        k_vals = [4, 32, 43]
+
+    checkpoints = _load_checkpoints(checkpoints_dir, checkpoint_stride)
+
+    def _extract_W(model: Transformer):
+        if weight_matrix == 'W_E':
+            W = model.embed.W_E.detach().cpu()
+            return W[:, :-1]
+        elif weight_matrix == 'W_L':
+            W_U = model.unembed.W_U.detach().cpu()
+            W_down = model.blocks[0].mlp.W_down.detach().cpu()
+            W = W_U.T @ W_down
+            W = W[:-1, :]
+            return W.T
+        else:
+            raise ValueError(f'Unrecognized weight_matrix type: {weight_matrix}')
+
+    # Compute bases from the last checkpoint only
+    last_model = Transformer()
+    last_ckpt = torch.load(checkpoints[-1], weights_only=False)
+    last_model.load_state_dict(last_ckpt['model_state_dict'])
+    W_last = _extract_W(last_model)
+    _, P = W_last.shape
+
+    fourier_coeffs_last = get_fourier_coeffs_by_hand(W_last, P)
+    k_to_basis_vecs: dict[int, torch.Tensor] = {}
+    for k in k_vals:
+        bv = fourier_coeffs_last[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]].clone()
+        bv_norm = bv.norm(p=2, dim=0, keepdim=True)
+        bv = bv / bv_norm   # shape (d_model, 2)
+        k_to_basis_vecs[k] = bv
+
+    # Step 3: initialize shared state
+    frame_cache: dict[int, dict] = {}
+    n_k = len(k_vals)
+    fig, axs = plt.subplots(1, n_k, figsize=(7 + 5 * (n_k - 1), 7))
+    if n_k == 1:
+        axs = [axs]
+    plt.subplots_adjust(bottom=0.15)
+    ax_slider = fig.add_axes([0.15, 0.05, 0.7, 0.03])
+    slider = plt.Slider(ax_slider, 'Frame', 0, len(checkpoints) - 1, valinit=0, valstep=1)
+
+    # Step 4: pre-compute projected coordinates for every frame
+    model = Transformer()
+    for frame_idx, ckpt_path in enumerate(tqdm(checkpoints, desc='Pre-computing frames')):
+        chkpt_dict = torch.load(ckpt_path, weights_only=False)
+        model.load_state_dict(chkpt_dict['model_state_dict'])
+        W = _extract_W(model)
+        feats = W.T  # shape (P, d_model)
+
+        k_data = {}
+        for k in k_vals:
+            bv = k_to_basis_vecs[k]
+            b1_mag = (feats @ bv[:, 0]).numpy()
+            b2_mag = (feats @ bv[:, 1]).numpy()
+            milli_period = int(1000 * P / k)
+            cmap_k = plt.get_cmap('coolwarm', milli_period)
+            colors = [cmap_k(i * 1000 % milli_period) for i in range(P)]
+            k_data[k] = {
+                'b1': b1_mag,
+                'b2': b2_mag,
+                'colors': colors
+            }
+
+        frame_cache[frame_idx] = {
+            'k_data': k_data,
+            'epoch': int(ckpt_path.stem.split('_')[-1]),
+        }
+
+    def update(val):
+        frame_idx = int(val)
+        data = frame_cache[frame_idx]
+        for ax, k in zip(axs, k_vals):
+            ax.clear()
+            kd = data['k_data'][k]
+            ax.scatter(kd['b1'], kd['b2'], c=kd['colors'], s=50, alpha=0.8)
+            for p in range(P):
+                ax.annotate(
+                    str(p),
+                    (kd['b1'][p], kd['b2'][p]),
+                    fontsize=8,
+                    alpha=0.7,
+                    xytext=(3, 3),
+                    textcoords='offset points',
+                )
+            beautify_ax(ax, xmin=-z, xmax=z, ymin=-z, ymax=z)
+            ax.set_xlabel('PC 1')
+            ax.set_ylabel('PC 2')
+            ax.set_title(
+                f'Freq={k}, Period={P/k:.3f}\n'
+                f'Epoch {data["epoch"]}',
+                fontsize=10,
+            )
+        fig.canvas.draw_idle()
+
+    slider.on_changed(update)
+    update(0)
     plt.show()
 
 def inspect_attention_maps(
@@ -3599,10 +3793,20 @@ if __name__ == '__main__':
     #     # Z=30.,
     # )
 
-    ablate_and_measure_performance(
-        model,
-        a_values = [i for i in range(57)],
-        k_values = [4, 32, 43],
-        hook_point='blocks.0.mlp.hook_pre',
-        use_PC_idxs=[],
-    )
+    # ablate_and_measure_performance(
+    #     model,
+    #     a_values = [i for i in range(57)],
+    #     k_values = [4, 32, 43],
+    #     hook_point='blocks.0.mlp.hook_pre',
+    #     use_PC_idxs=[],
+    # )
+
+    # +------------------+
+    # | PART 2: HENRY!!! |
+    # +------------------+
+    CHECKPOINT_DIR = 'checkpoints/grokked_20k'
+    # inspect_periodic_nature(model, weight_matrix='W_E', do_DFT_by_hand=True)
+    # inspect_evolving_periodic_nature(CHECKPOINT_DIR, checkpoint_stride=200, weight_matrix='W_E')
+
+    # inspect_PCA_W_E(model, weight_matrix='W_E', k_vals=[4, 32, 43], z=1.0)
+    inspect_evolving_PCA_W(CHECKPOINT_DIR, checkpoint_stride=200, weight_matrix='W_E', z=1.0)
