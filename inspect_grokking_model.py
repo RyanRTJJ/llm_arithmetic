@@ -222,7 +222,7 @@ def inspect_periodic_nature(
         W = W.T                                                 # shape (d_mlp, P)
     else:
         raise ValueError(f'Unrecognized weight_matrix type: {weight_matrix}')
-    
+
     _, P = W.shape
 
     _, ax = plt.subplots(1, 1, figsize=(12, 4))
@@ -470,9 +470,6 @@ def inspect_attention_maps_periodic_nature(
     y = [i for i in range(0, P)]
     sample_pairs = [(x, _y, P) for _y in y]
 
-    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
-    print(f'\n🔍 Inspecting attn maps for periodic nature for pairs: {sample_pairs}...')
-
     # Make the dataloader (full batch)
     sample_dataset = MyDataset(sample_pairs)
     sample_dataloader = DataLoader(sample_dataset, batch_size = len(sample_dataset))
@@ -543,8 +540,6 @@ def inspect_attention_z_values(
     x = 70
     y = list(range(P))
     sample_pairs = [(x, _y, P) for _y in y]
-
-    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
 
     # Make the dataloader (full batch)
     sample_dataset = MyDataset(sample_pairs)
@@ -752,7 +747,7 @@ def get_interpolation(
         # make a color gradient line
         vertices = result.reshape(-1, 1, 2)
         segments = np.concatenate([vertices[:-1], vertices[1:]], axis=1)
-        
+
         # Create color array based on position along the curve
         assert n == 113, f'Unexpected n: {n}'
         milli_period = int(1000 * n / k)
@@ -783,8 +778,6 @@ def inspect_attention_outputs(
     x = 70
     y = list(range(P))
     sample_pairs = [(x, _y, P) for _y in y]
-
-    num_samples = len(sample_pairs) # Just in case num_samples > len(test_pairs)
 
     # Make the dataloader (full batch)
     sample_dataset = MyDataset(sample_pairs)
@@ -839,7 +832,7 @@ def inspect_attention_outputs(
     # Only want to focus on the `=` token
     o_values_this_head = o_values_this_head[:,-1,:]                 # shape (b, d_model)
     print(f'o_values_this_head.shape: {o_values_this_head.shape}')
-    
+
     o_values_projected = (o_values_this_head @ new_basis).numpy()
     b1_mag = o_values_projected[:,0]
     b2_mag = o_values_projected[:,1]
@@ -870,7 +863,7 @@ def inspect_attention_outputs(
         # Do scatter
         for ax, s in zip(axes_with_scatters, [30, 30]):
             ax.scatter(b1_mag, b2_mag, color=cmap(2), s=s, alpha=0.9)
-        
+
         if annotate_scatter:
             # Annotate each point with its index
             for p in range(P):
@@ -932,7 +925,7 @@ def get_z_vectors_by_head(model: Transformer, dataloader: DataLoader):
         for i in range(num_heads):
             # (b, num_tokens, d_head)
             z_values_by_head[f'head_{i}'] = z_values[:, i, :, :]
-    
+
     return z_values_by_head
 
 def animate_attention_outputs_in_agg(
@@ -1078,7 +1071,7 @@ def animate_attention_outputs_in_agg(
         f'$\\bf{{o\ vectors}}$\nin 2D subspace corresponding to freq {k} Hz embedding circle',
         fontsize=11
     )
-    
+
     interval = 150
     anim = FuncAnimation(fig, update, frames=len(a_values), interval=interval, repeat=True)
     plt.show()
@@ -1113,7 +1106,6 @@ def inspect_attention_outputs_in_agg(
     model.eval()
     z_values_by_head = {}
     o_values_cached = None
-    o_values_by_head = {}
     num_heads = None
 
     for batch_x, batch_y in sample_dataloader:
@@ -1245,7 +1237,6 @@ def inspect_attention_outputs_in_agg(
     plt.show()
 
 def inspect_attention_outputs_periodic_nature(
-        model: Transformer,
         o_dict: dict[str, np.ndarray],
         do_projected: bool = True,
 ):
@@ -1287,8 +1278,11 @@ def inspect_attention_outputs_periodic_nature(
 
 def get_embeddings_circle_bases(
         embeddings: np.ndarray,
-        k_values: list[int] = [4, 32, 43],
+        k_values: list[int] = None,
 ):
+    # Avoid using list as default arg since mutable
+    if k_values is None:
+        k_values = [4, 32, 43]
 
     P, d = embeddings.shape
     o_values = torch.Tensor(embeddings.T)
@@ -1308,8 +1302,11 @@ def get_embeddings_circle_bases(
 
 def get_WE_circle_bases(
         W_E: np.ndarray | torch.Tensor,
-        k_values: list[int] = [4, 32, 43],
+        k_values: list[int] = None,
 ):
+    # Avoid using list as default arg since mutable
+    if k_values is None:
+        k_values = [4, 32, 43]
     b, P = W_E.shape
     fourier_coeffs = get_fourier_coeffs_by_hand(W_E, P)
 
@@ -1371,11 +1368,14 @@ def visualize_o_circles(
 def do_WE_and_o_coexist(
         model: Transformer,
         o_dict: dict[str, np.ndarray],
-        k_values: list[int] = [4, 32, 43],
+        k_values: list[int] = None,
 ):
     """
     Finds the basis vectors for the o vectors as well as the W_E vectors
     """
+    # Avoid using list as default arg since mutable
+    if k_values is None:
+        k_values = [4, 32, 43]
     k_to_o_basis_vecs = get_embeddings_circle_bases(
         embeddings=o_dict['o'],
         k_values=k_values,
@@ -1446,32 +1446,25 @@ def do_WE_and_o_coexist(
 def visualize_W_up_PCA(
         model: Transformer,
         o_dict: dict[str, np.ndarray],
-        k_values: list[int] = [4, 32, 43],
+        k_values: list[int] = None,
 ):
     """
     Finds the basis vectors for the o vectors as well as the W_E vectors
     """
+    # Avoid using list as default arg since mutable
+    if k_values is None:
+        k_values = [4, 32, 43]
     k_to_o_basis_vecs = get_embeddings_circle_bases(
         embeddings=o_dict['o'],
         k_values=k_values,
     )
 
-    o_values = o_dict['o']      # shape (P, d_model)
-    P, d_model = o_values.shape
-
     W_E = model.embed.W_E.detach().cpu()                    # shape (d_model, d_vocab)
     W_E = W_E[:,:-1]                                        # shape (d_model, P)
 
-    k_to_embedding_basis_vecs = get_WE_circle_bases(
-        W_E=W_E,
-        k_values=k_values,
-    )
-    # Each basis in each of the above dicts are shape (d_model, 2)
-
     W_up = model.blocks[0].mlp.W_up.detach().cpu()          # shape (d_mlp, d_model)
 
-    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 5))
-    cmap = plt.get_cmap('coolwarm', 7)
+    _, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 5))
     Z = 5.
     SCATTER_WIDTH = 30
     LINEWIDTH = 1
@@ -1482,7 +1475,7 @@ def visualize_W_up_PCA(
     for i, k in enumerate(k_values):
         ax = axes[i]
         W_up_projected = W_up @ k_to_o_basis_vecs[k]
-        
+
         # Scatter plot: this is really inefficient lol
         for v in W_up_projected:
             draw_vector(ax, v, scatter_kwargs, line_kwargs)
@@ -1498,7 +1491,7 @@ def visualize_W_up_PCA(
             f'Fourier Coeffs for {k} Hz ',
             fontsize=10
         )
-    
+
     plt.suptitle(f'$\\bf{{W\_up\ vectors\ in\ 2D\ Subspace\ Corresponding\ To:}}$', fontsize=11)
     plt.show()
 
@@ -1584,7 +1577,7 @@ def profile_W_up_singular_vector_spaces(model: Transformer):
         angle_deg = np.degrees(principle_angle)
         subspace_angles_deg.append(angle_deg)
     subspace_angles_deg = np.array(subspace_angles_deg)
-    
+
     # Smallest subspace angle idxs
     smallest_subspace_angle_idxs = np.argsort(subspace_angles_deg)[:8]
     print(f'Most similar dimensions to top 8 singular vectors: {smallest_subspace_angle_idxs}')
@@ -1902,12 +1895,6 @@ def show_WL_wrt_MLP_outs(
     fig, axes = plt.subplots(nrows=1, ncols=len(k_values), figsize=(14, 6))
     Z = 200.0
 
-    # 1 per ax
-    annotation_offsets = [
-        np.array([-100, -200]),
-        np.array([-50, -100]),
-        np.array([100, -50])
-    ]
     for ax_i, ax in enumerate(axes):
         k = k_values[ax_i]
 
@@ -2635,7 +2622,7 @@ def is_MLP_conical(
 
         beautify_ax_3d(ax, Z)
         add_axis_lines_3d(ax, Z)
-    
+
     plt.show()
 
 def make_conical_animation(
@@ -2668,7 +2655,6 @@ def make_conical_animation(
         model.eval()
         z_values_by_head = {}
         embeddings_cached = None
-        o_values_by_head = {}
         num_heads = None
 
         for batch_x, _ in sample_dataloader:
@@ -2854,8 +2840,6 @@ def guess_W_down(
 
         model.eval()
         mlp_acts_cached = None
-        o_values_by_head = {}
-        num_heads = None
 
         for batch_x, _ in sample_dataloader:
             _ = model(batch_x)
@@ -3085,8 +3069,8 @@ def guess_W_down(
 
 def look_for_unseen_o_components(
         model,
-        a_values = [i for i in range(57)],
-        k_values = [4, 32, 43],
+        a_values = None,
+        k_values = None,
         hook_point='blocks.0.mlp.hook_pre',
         gradient_interpolation: bool = True,
 ):
@@ -3095,6 +3079,11 @@ def look_for_unseen_o_components(
     we already found the rotational components. I want to figure out which
     dimensions of o these PCs correspond to.
     """
+    # Avoid using list as default arg since mutable
+    if a_values is None:
+        a_values = [i for i in range(57)]
+    if k_values is None:
+        k_values = [4, 32, 43]
     # Create sample pairs
     P = 113
     b_values = list(range(P))
@@ -3264,7 +3253,7 @@ def look_for_unseen_o_components(
                         s=SCATTER_SIZE,
                         alpha=SCATTER_ALPHA
                     )
-                
+
                     # Text for displaying a value
                     ax.text(
                         0.03,
@@ -3294,7 +3283,7 @@ def look_for_unseen_o_components(
 
                     # Do scatter
                     ax.scatter(b1_mag, b2_mag, color=colors, s=SCATTER_SIZE, alpha=SCATTER_ALPHA)
-                
+
                     # Text for displaying a value
                     ax.text(
                         0.03,
@@ -3315,7 +3304,7 @@ def look_for_unseen_o_components(
                         verticalalignment='center',
                         rotation=90
                     )
-                
+
                 if k_i == 0:
                     if col_idx < num_heads:
                         ax_title = f'attn head {head_i} only'
@@ -3336,7 +3325,7 @@ def look_for_unseen_o_components(
         plot_subject += '  - in 2D subspace corresponding to 3rd & 4th PCs of all k-Hz circles in pre-ReLU MLP embeddings'
     else:
         raise RuntimeError(f'Unimplemented o_circles_clockwork for {hook_point}')
-    
+
     plt.suptitle(
         plot_subject,
         fontsize=11,
@@ -3351,16 +3340,25 @@ def look_for_unseen_o_components(
 
 def ablate_and_measure_performance(
         model: Transformer,
-        a_values = [i for i in range(57)],
-        k_values = [4, 32, 43],
+        a_values = None,
+        k_values = None,
         hook_point='blocks.0.mlp.hook_pre',
-        use_PC_idxs = [2, 3],
+        use_PC_idxs = None,
 ):
     """
     Remember that when we visualized hook_post / hook_pre (3rd and 4th PCs),
     we already found the rotational components. I want to figure out which
     dimensions of o these PCs correspond to.
+
+    @param use_PC_idxs:     PCs to ABLATE
     """
+    # Avoid using list as default arg since mutable
+    if a_values is None:
+        a_values = [i for i in range(57)]
+    if k_values is None:
+        k_values = [4, 32, 43]
+    if use_PC_idxs is None:
+        use_PC_idxs = [2, 3]
     # Create sample pairs
     P = 113
     b_values = list(range(P))
@@ -3415,9 +3413,9 @@ def ablate_and_measure_performance(
     k_to_basis_vecs_o_space = {}
     for k_i, k in enumerate(k_values):
         bases = [b for b in k_to_a_to_basis_vecs[k].values()]
-        basis_matrix = np.concatenate(bases, axis=1)                    # shape (d_model / d_mlp, a * 2)
+        basis_matrix = np.concatenate(bases, axis=1)        # shape (d_model / d_mlp, a * 2)
         U, S, Vt = np.linalg.svd(basis_matrix, full_matrices=False)
-        basis_vecs = U[:, use_PC_idxs]                                       # shape (d_mlp, 2)
+        basis_vecs = U[:, use_PC_idxs]                      # shape (d_mlp, 2)
         basis_vecs_o_space = W_up.T @ basis_vecs
         k_to_basis_vecs_o_space[k] = basis_vecs_o_space
 
@@ -3493,7 +3491,6 @@ if __name__ == '__main__':
     # K = 4
     # o_dict = np.load(O_PROJECTED_SAVE_LOC.format(k=K))
     # inspect_attention_outputs_periodic_nature(
-    #     model,
     #     o_dict,
     #     do_projected=False
     # )
@@ -3583,13 +3580,13 @@ if __name__ == '__main__':
     #     skip_animation=True,
     # )
 
-    show_WL_wrt_MLP_outs(
-        model,
-        k_values = [4, 32, 43],
-        a_values = [i for i in range(57)],
-        expected_ans=65,
-        use_basis_cached=True
-    )
+    # show_WL_wrt_MLP_outs(
+    #     model,
+    #     k_values = [4, 32, 43],
+    #     a_values = [i for i in range(57)],
+    #     expected_ans=65,
+    #     use_basis_cached=True
+    # )
 
     # look_for_unseen_o_components(
     #     model,
@@ -3602,10 +3599,10 @@ if __name__ == '__main__':
     #     # Z=30.,
     # )
 
-    # ablate_and_measure_performance(
-    #     model,
-    #     a_values = [i for i in range(57)],
-    #     k_values = [4, 32, 43],
-    #     hook_point='blocks.0.mlp.hook_pre',
-    #     use_PC_idxs=[0, 1, 2, 3],
-    # )
+    ablate_and_measure_performance(
+        model,
+        a_values = [i for i in range(57)],
+        k_values = [4, 32, 43],
+        hook_point='blocks.0.mlp.hook_pre',
+        use_PC_idxs=[],
+    )
