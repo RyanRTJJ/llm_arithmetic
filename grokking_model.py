@@ -6,6 +6,7 @@ Desc:       Reproduce the Neel Nanda Grokking (modulo addition) Paper: https://o
 Date:       2025, Nov 5 started
 Author:     ryan.rtjj@gmail.com
 """
+import argparse
 import glob
 import io
 import os
@@ -209,6 +210,7 @@ class TransformerBlock(nn.Module):
             n_ctx: int = N_CTX,
             act_type: str = ACT_TYPE,
             replace_mlp_with_reluless: bool = False,
+            no_mlp: bool = False,
             ablate_o_subspace: torch.Tensor | np.ndarray | None = None,
     ):
         """
@@ -217,7 +219,10 @@ class TransformerBlock(nn.Module):
         """
         super().__init__()
         self.attn = Attention(d_model, num_heads, d_head, n_ctx)
-        self.mlp = MLP(d_model, d_mlp, act_type, replace_mlp_with_reluless)
+        self.no_mlp = no_mlp
+
+        if not no_mlp:
+            self.mlp = MLP(d_model, d_mlp, act_type, replace_mlp_with_reluless)
         self.hook_mlp_out = HookPoint()
         self.ablation_matrix = None
 
@@ -237,7 +242,8 @@ class TransformerBlock(nn.Module):
         if isinstance(self.ablation_matrix, torch.Tensor):
             x = x @ self.ablation_matrix.T
 
-        x = x + self.hook_mlp_out(self.mlp(x))      # resid_post
+        if not self.no_mlp:
+            x = x + self.hook_mlp_out(self.mlp(x))      # resid_post
         return x
 
 class Transformer(nn.Module):
@@ -263,6 +269,7 @@ class Transformer(nn.Module):
             n_ctx: int = N_CTX,
             act_type: str = ACT_TYPE,
             replace_mlp_with_reluless: bool = False,
+            no_mlp = False,
     ):
         """
         Missing params:
@@ -281,6 +288,7 @@ class Transformer(nn.Module):
                 n_ctx,
                 act_type,
                 replace_mlp_with_reluless,
+                no_mlp,
             ) for _ in range(num_layers)
         ])
         self.unembed = Unembed(d_vocab, d_model)
@@ -561,22 +569,40 @@ def train(
 
 
 if __name__ == '__main__':
-    RUN_NAME = 'debug_reluless'
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--run_name', type=str, default='debug_repro_reluless')
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--model_save_freq', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=20000)
+    args = parser.parse_args()
+
+    RUN_NAME = args.run_name
 
     CHECKPOINTS_DIR = Path(f'checkpoints/{RUN_NAME}')
     DATA_DIR = Path(f'datasets/{RUN_NAME}')
     TENSORBOARDS_DIR = Path(f'tensorboards/{RUN_NAME}')
-    prepare_dirs([CHECKPOINTS_DIR, DATA_DIR, TENSORBOARDS_DIR], True)
+    INIT_WEIGHTS_DIR = Path(f'init_weights/{RUN_NAME}')
+    prepare_dirs([CHECKPOINTS_DIR, DATA_DIR, TENSORBOARDS_DIR, INIT_WEIGHTS_DIR], True)
 
     data_file = DATA_DIR / 'dataset.pkl'
     generate_data(0.3, P=PRIME, save_filename=data_file)
 
-
+    # Seed 43, lr 0.005, epochs 20000 worked for reluless
+    torch.manual_seed(43)
     model = Transformer(replace_mlp_with_reluless=True)
+
+    # Save the init weights
+    torch.save(
+        {'model_state_dict': model.state_dict()},
+        INIT_WEIGHTS_DIR / 'init_weights.pt'
+    )
+
     train(
         model,
         data_file,
         CHECKPOINTS_DIR,
         TENSORBOARDS_DIR,
-        epochs=20000,
+        epochs=args.epochs,
+        lr=args.lr,
+        model_save_freq=args.model_save_freq
     )

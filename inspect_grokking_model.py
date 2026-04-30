@@ -469,6 +469,10 @@ def inspect_evolving_PCA_W(
     k_to_basis_vecs: dict[int, torch.Tensor] = {}
     for k in k_vals:
         bv = fourier_coeffs_last[:, [1 + 2 * (k - 1), 2 + 2 * (k - 1)]].clone()
+
+        # Orthonormalize via Gram-Schmidt so projection preserves circular geometry
+        bv[:, 1] = bv[:, 1] - (bv[:, 1] @ bv[:, 0]) / (bv[:, 0] @ bv[:, 0]) * bv[:, 0]
+
         bv_norm = bv.norm(p=2, dim=0, keepdim=True)
         bv = bv / bv_norm   # shape (d_model, 2)
         k_to_basis_vecs[k] = bv
@@ -3805,8 +3809,17 @@ if __name__ == '__main__':
     # | PART 2: HENRY!!! |
     # +------------------+
     CHECKPOINT_DIR = 'checkpoints/grokked_20k'
+    # CHECKPOINT_DIR = 'checkpoints/reluless_43_005_10000' # grokked
+    CHECKPOINT_DIR = 'checkpoints/reluless_43_001_10000' # did not grok
+    CHECKPOINT_STRIDE = 100
     # inspect_periodic_nature(model, weight_matrix='W_E', do_DFT_by_hand=True)
-    # inspect_evolving_periodic_nature(CHECKPOINT_DIR, checkpoint_stride=200, weight_matrix='W_E')
+    inspect_evolving_periodic_nature(CHECKPOINT_DIR, checkpoint_stride=CHECKPOINT_STRIDE, weight_matrix='W_E', ymax=5)
 
     # inspect_PCA_W_E(model, weight_matrix='W_E', k_vals=[4, 32, 43], z=1.0)
-    inspect_evolving_PCA_W(CHECKPOINT_DIR, checkpoint_stride=200, weight_matrix='W_E', z=1.0)
+    inspect_evolving_PCA_W(
+        CHECKPOINT_DIR,
+        checkpoint_stride=CHECKPOINT_STRIDE,
+        weight_matrix='W_E',
+        k_vals=[4, 8, 24, 25, 48, 50],
+        z=0.5
+    )
